@@ -296,15 +296,15 @@ def load_json(
 def normalize_filename(
         filename):
 
-
     if not filename:
-
         return None
 
-
-    return os.path.splitext(
+    name = os.path.splitext(
         os.path.basename(filename)
     )[0].lower()
+
+    name = name.replace("_", " ").replace("-", " ")
+    return " ".join(name.split())
 
 
 
@@ -336,6 +336,9 @@ def create_thumbnail_file(
         source,
         output,
         size=150):
+
+    if os.path.exists(output) and os.path.getsize(output) > 0:
+        return True
 
     try:
 
@@ -1778,6 +1781,9 @@ def create_thumbnail(
             f"/tmp/"
             f"inat_thumbnail_{row_number}.jpg"
         )
+
+        if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
+            return thumb_path
 
 
         img.convert(

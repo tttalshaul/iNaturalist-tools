@@ -1,3 +1,4 @@
+*.pyc
 local_image_cache.json
 observations.json
 token.txt
