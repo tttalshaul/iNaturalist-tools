@@ -2,4 +2,5 @@ local_image_cache.json
 observations.json
 token.txt
 observations-*.csv
+non_live_photos.json
 inat_comparison/

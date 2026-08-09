@@ -1320,6 +1320,13 @@ def scan_local_images(
         use_cache=False,
         non_live_file="non_live_photos.json"):
 
+    def make_sig_key(sig):
+        if isinstance(sig, dict):
+            return (sig.get("size"), sig.get("mtime"))
+        if isinstance(sig, (list, tuple)) and len(sig) == 2:
+            return (sig[0], sig[1])
+        return sig
+
     non_live_paths = set()
     non_live_signatures = set()
     non_live_filenames = set()
@@ -1329,8 +1336,8 @@ def scan_local_images(
             nl_data = load_json(non_live_file)
             if isinstance(nl_data, dict):
                 non_live_paths = {os.path.abspath(p) for p in nl_data.get("paths", [])}
-                non_live_signatures = set(nl_data.get("signatures", []))
-                non_live_filenames = {normalize_filename(f) for f in nl_data.get("filenames", [])}
+                non_live_signatures = {make_sig_key(s) for s in nl_data.get("signatures", []) if s is not None}
+                non_live_filenames = {normalize_filename(f) for f in nl_data.get("filenames", []) if f}
             elif isinstance(nl_data, list):
                 non_live_paths = {os.path.abspath(p) for p in nl_data}
             print(f"Loaded non-live creature exclusions from {non_live_file}.")
@@ -1354,11 +1361,12 @@ def scan_local_images(
 
                 abs_path = os.path.abspath(path)
                 signature = get_file_signature(path)
+                sig_key = (signature.get("size"), signature.get("mtime"))
                 norm_name = normalize_filename(filename)
 
                 if (abs_path in non_live_paths or
                     path in non_live_paths or
-                    signature in non_live_signatures or
+                    sig_key in non_live_signatures or
                     norm_name in non_live_filenames):
                     skipped_non_live += 1
                     continue
