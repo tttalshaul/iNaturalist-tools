@@ -9,6 +9,7 @@ import subprocess
 import html
 import shutil
 from pathlib import Path
+import hashlib
 
 from datetime import datetime
 
@@ -322,6 +323,15 @@ def timestamp_minute(
 
 from PIL import Image
 
+def get_thumbnail_filename(image_path):
+    path_obj = Path(image_path).resolve()
+    path_hash = hashlib.sha256(str(path_obj).encode("utf-8")).hexdigest()[:12]
+    safe_stem = "".join(c for c in path_obj.stem if c.isalnum() or c in ("-", "_")).rstrip()
+    if not safe_stem:
+        safe_stem = "thumb"
+    return f"{safe_stem}_{path_hash}.thumb.jpg"
+
+
 def create_thumbnail_file(
         source,
         output,
@@ -389,512 +399,450 @@ def create_html_report(
         local_missing,
         output_dir):
 
+    output_dir = Path(output_dir)
+    thumb_dir = output_dir / "thumbnails"
+    local_thumb_dir = thumb_dir / "local"
 
-    output_dir = Path(
-        output_dir
-    )
+    for d in [output_dir, local_thumb_dir]:
+        d.mkdir(parents=True, exist_ok=True)
 
-    thumb_dir = (
-        output_dir /
-        "thumbnails"
-    )
+    html_file = output_dir / "report.html"
 
-    local_thumb_dir = (
-        thumb_dir /
-        "local"
-    )
+    matched_results = [r for r in results if r.get("status") == "MATCHED"]
+    matched_count = len(matched_results)
+    unmatched_count = len(local_missing)
+    total_count = matched_count + unmatched_count
 
-
-    for d in [
-        output_dir,
-        local_thumb_dir
-    ]:
-        d.mkdir(
-            parents=True,
-            exist_ok=True
-        )
-
-
-    html_file = (
-        output_dir /
-        "report.html"
-    )
-
-
-    with open(
-        html_file,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-
-        f.write("""
-<!DOCTYPE html>
+    with open(html_file, "w", encoding="utf-8") as f:
+        f.write(f"""<!DOCTYPE html>
 <html>
 <head>
-
 <meta charset="utf-8">
-
-<title>
-iNaturalist comparison
-</title>
-
-
+<title>iNaturalist comparison</title>
 <style>
-
-body {
-    font-family: Arial;
-}
-
-table {
+body {{
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    margin: 20px;
+    background: #f8f9fa;
+    color: #333;
+}}
+h1 {{
+    color: #2c3e50;
+    margin-bottom: 20px;
+}}
+.toolbar {{
+    background: #fff;
+    padding: 15px;
+    border-radius: 8px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+    margin-bottom: 20px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 15px;
+    align-items: center;
+}}
+.toolbar input[type="text"] {{
+    padding: 8px 12px;
+    font-size: 15px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    width: 320px;
+}}
+.btn {{
+    padding: 8px 14px;
+    font-size: 14px;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    background: #007bff;
+    color: white;
+    font-weight: 500;
+    transition: background 0.2s;
+}}
+.btn:hover {{
+    background: #0056b3;
+}}
+.btn-success {{
+    background: #28a745;
+}}
+.btn-success:hover {{
+    background: #218838;
+}}
+.btn-secondary {{
+    background: #6c757d;
+}}
+.btn-secondary:hover {{
+    background: #5a6268;
+}}
+.btn-warning {{
+    background: #ffc107;
+    color: #212529;
+}}
+.btn-warning:hover {{
+    background: #e0a800;
+}}
+.tabs {{
+    display: flex;
+    gap: 10px;
+    margin-bottom: 15px;
+    border-bottom: 2px solid #dee2e6;
+    padding-bottom: 10px;
+}}
+.tab-btn {{
+    padding: 10px 18px;
+    font-size: 15px;
+    border: none;
+    border-radius: 6px 6px 0 0;
+    background: #e9ecef;
+    color: #495057;
+    cursor: pointer;
+    font-weight: bold;
+}}
+.tab-btn.active {{
+    background: #28a745;
+    color: white;
+}}
+table {{
     border-collapse: collapse;
-    width:100%;
-}
-
-td,th {
-    border:1px solid #ccc;
-    padding:5px;
-}
-
-img {
-    max-width:200px;
-    max-height:200px;
-}
-
-input {
-    width:400px;
-    font-size:18px;
-}
-
+    width: 100%;
+    background: white;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+    border-radius: 8px;
+    overflow: hidden;
+}}
+th {{
+    background: #f1f3f5;
+    color: #495057;
+    text-align: left;
+    padding: 10px;
+    border-bottom: 2px solid #dee2e6;
+}}
+td {{
+    border-bottom: 1px solid #e9ecef;
+    padding: 10px;
+    vertical-align: middle;
+}}
+img {{
+    max-width: 140px;
+    max-height: 140px;
+    border-radius: 4px;
+    border: 1px solid #ddd;
+    object-fit: cover;
+}}
+.pagination {{
+    margin-top: 15px;
+    display: flex;
+    align-items: center;
+    gap: 15px;
+}}
+.non-live-row {{
+    background-color: #fff3cd !important;
+    opacity: 0.7;
+}}
+.badge-non-live {{
+    display: inline-block;
+    padding: 4px 8px;
+    font-size: 12px;
+    font-weight: bold;
+    color: #856404;
+    background-color: #ffeeba;
+    border: 1px solid #ffe8a1;
+    border-radius: 4px;
+    margin-left: 8px;
+}}
 </style>
 
 <script>
 let currentPage = 0;
 const pageSize = 100;
+let currentTab = "unmatched";
 
+let nonLivePaths = new Set();
+let nonLiveSignatures = new Set();
+let nonLiveFilenames = new Set();
 
-function showPage(page) {
+function initNonLiveStore() {{
+    try {{
+        let saved = localStorage.getItem("inat_non_live_photos");
+        if (saved) {{
+            let data = JSON.parse(saved);
+            if (data.paths) data.paths.forEach(p => nonLivePaths.add(p));
+            if (data.signatures) data.signatures.forEach(s => nonLiveSignatures.add(s));
+            if (data.filenames) data.filenames.forEach(f => nonLiveFilenames.add(f));
+        }}
+    }} catch(e) {{
+        console.error("Failed to load non-live photos from localStorage", e);
+    }}
+}}
 
+function saveNonLiveStore() {{
+    let payload = {{
+        paths: Array.from(nonLivePaths),
+        signatures: Array.from(nonLiveSignatures),
+        filenames: Array.from(nonLiveFilenames)
+    }};
+    localStorage.setItem("inat_non_live_photos", JSON.stringify(payload));
+}}
+
+function toggleNonLive(btn, path, filename, signature) {{
+    let row = btn.closest("tr");
+    let isNonLive = nonLivePaths.has(path) || (filename && nonLiveFilenames.has(filename));
+
+    if (isNonLive) {{
+        if (path) nonLivePaths.delete(path);
+        if (filename) nonLiveFilenames.delete(filename);
+        if (signature) nonLiveSignatures.delete(signature);
+        row.classList.remove("non-live-row");
+        btn.innerText = "🚫 Mark Not Live";
+        btn.className = "btn btn-warning btn-toggle-nonlive";
+        let badge = row.querySelector(".badge-non-live");
+        if (badge) badge.style.display = "none";
+    }} else {{
+        if (path) nonLivePaths.add(path);
+        if (filename) nonLiveFilenames.add(filename);
+        if (signature) nonLiveSignatures.add(signature);
+        row.classList.add("non-live-row");
+        btn.innerText = "🌱 Mark as Live";
+        btn.className = "btn btn-secondary btn-toggle-nonlive";
+        let badge = row.querySelector(".badge-non-live");
+        if (badge) badge.style.display = "inline-block";
+    }}
+    saveNonLiveStore();
+    filterTable();
+}}
+
+function exportNonLiveJSON() {{
+    let payload = {{
+        paths: Array.from(nonLivePaths),
+        signatures: Array.from(nonLiveSignatures),
+        filenames: Array.from(nonLiveFilenames)
+    }};
+    let dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(payload, null, 2));
+    let downloadAnchor = document.createElement('a');
+    downloadAnchor.setAttribute("href", dataStr);
+    downloadAnchor.setAttribute("download", "non_live_photos.json");
+    document.body.appendChild(downloadAnchor);
+    downloadAnchor.click();
+    downloadAnchor.remove();
+}}
+
+function importNonLiveJSON(event) {{
+    let file = event.target.files[0];
+    if (!file) return;
+    let reader = new FileReader();
+    reader.onload = function(e) {{
+        try {{
+            let data = JSON.parse(e.target.result);
+            if (Array.isArray(data)) {{
+                data.forEach(p => nonLivePaths.add(p));
+            }} else if (typeof data === "object") {{
+                if (data.paths) data.paths.forEach(p => nonLivePaths.add(p));
+                if (data.signatures) data.signatures.forEach(s => nonLiveSignatures.add(s));
+                if (data.filenames) data.filenames.forEach(f => nonLiveFilenames.add(f));
+            }}
+            saveNonLiveStore();
+            applySavedNonLiveToRows();
+            filterTable();
+            alert("Loaded non-live creature choices successfully!");
+        }} catch(err) {{
+            alert("Error parsing JSON file: " + err.message);
+        }}
+    }};
+    reader.readAsText(file);
+}}
+
+function applySavedNonLiveToRows() {{
+    let rows = document.querySelectorAll("#results tbody tr");
+    rows.forEach(function(row) {{
+        let path = row.dataset.path;
+        let filename = row.dataset.filename;
+        let sig = row.dataset.signature;
+        let btn = row.querySelector(".btn-toggle-nonlive");
+        let badge = row.querySelector(".badge-non-live");
+
+        if (btn && (nonLivePaths.has(path) || (filename && nonLiveFilenames.has(filename)) || (sig && nonLiveSignatures.has(sig)))) {{
+            row.classList.add("non-live-row");
+            btn.innerText = "🌱 Mark as Live";
+            btn.className = "btn btn-secondary btn-toggle-nonlive";
+            if (badge) badge.style.display = "inline-block";
+        }}
+    }});
+}}
+
+function switchTab(tab) {{
+    currentTab = tab;
+    document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
+    let activeBtn = document.getElementById("tab-" + tab);
+    if (activeBtn) activeBtn.classList.add("active");
+    filterTable();
+}}
+
+function filterTable() {{
+    let text = document.getElementById("search").value.toLowerCase();
+    let hideNonLive = document.getElementById("hide-non-live").checked;
+    let rows = document.querySelectorAll("#results tbody tr");
+
+    rows.forEach(function(row) {{
+        let isMatched = row.dataset.matched === "true";
+        let isNonLive = row.classList.contains("non-live-row");
+
+        let matchesTab = false;
+        if (currentTab === "all") {{
+            matchesTab = true;
+        }} else if (currentTab === "unmatched" && !isMatched) {{
+            matchesTab = true;
+        }} else if (currentTab === "matched" && isMatched) {{
+            matchesTab = true;
+        }}
+
+        let matchesSearch = !text || row.innerText.toLowerCase().includes(text);
+        let matchesNonLiveFilter = !hideNonLive || !isNonLive;
+
+        row.dataset.hidden = !(matchesTab && matchesSearch && matchesNonLiveFilter);
+    }});
+
+    showPage(0);
+}}
+
+function showPage(page) {{
     currentPage = page;
-
-    let rows =
-        document.querySelectorAll(
-            "#results tbody tr"
-        );
-
-
+    let rows = document.querySelectorAll("#results tbody tr");
     let visibleRows = [];
 
-    rows.forEach(function(row) {
-
-        if (row.dataset.hidden !== "true") {
+    rows.forEach(function(row) {{
+        if (row.dataset.hidden !== "true") {{
             visibleRows.push(row);
-        }
-
+        }}
         row.style.display = "none";
-
-    });
-
+    }});
 
     let start = page * pageSize;
     let end = start + pageSize;
 
+    visibleRows.slice(start, end).forEach(function(row) {{
+        row.style.display = "";
+    }});
 
-    visibleRows
-        .slice(start, end)
-        .forEach(function(row) {
+    document.getElementById("page_info").innerText =
+        "Page " + (page + 1) + " / " + Math.max(1, Math.ceil(visibleRows.length / pageSize)) +
+        " (" + visibleRows.length + " visible)";
+}}
 
-            row.style.display = "";
-
-        });
-
-
-    document.getElementById(
-        "page_info"
-    ).innerText =
-        "Page "
-        +
-        (page + 1)
-        +
-        " / "
-        +
-        Math.max(
-            1,
-            Math.ceil(
-                visibleRows.length / pageSize
-            )
-        );
-}
-
-
-function nextPage() {
-
-    let rows =
-        document.querySelectorAll(
-            "#results tbody tr"
-        );
-
+function nextPage() {{
+    let rows = document.querySelectorAll("#results tbody tr");
     let count = 0;
+    rows.forEach(row => {{ if (row.dataset.hidden !== "true") count++; }});
+    if ((currentPage + 1) * pageSize < count) showPage(currentPage + 1);
+}}
 
-    rows.forEach(function(row) {
-        if (row.dataset.hidden !== "true") {
-            count++;
-        }
-    });
+function previousPage() {{
+    if (currentPage > 0) showPage(currentPage - 1);
+}}
 
-
-    if (
-        (currentPage + 1) * pageSize < count
-    ) {
-        showPage(currentPage + 1);
-    }
-}
-
-
-function previousPage() {
-
-    if (currentPage > 0) {
-        showPage(currentPage - 1);
-    }
-
-}
-
-
-function filterTable() {
-
-    let text =
-        document
-        .getElementById("search")
-        .value
-        .toLowerCase();
-
-
-    let rows =
-        document.querySelectorAll(
-            "#results tbody tr"
-        );
-
-
-    rows.forEach(function(row) {
-
-        row.dataset.hidden =
-            !row.innerText
-            .toLowerCase()
-            .includes(text);
-
-    });
-
-
-    showPage(0);
-}
-
-
-window.onload = function() {
-    showPage(0);
-};
-
+window.onload = function() {{
+    initNonLiveStore();
+    applySavedNonLiveToRows();
+    switchTab("unmatched");
+}};
 </script>
-
 </head>
 
 <body>
 
+<h1>iNaturalist Local Comparison Report</h1>
 
-<h1>
-iNaturalist comparison
-</h1>
-
-
-<input
-id="search"
-onkeyup="filterTable()"
-placeholder="Search filename, ID, date..."
->
-
-
-""")
-
-
-        f.write("""
-<h2>
-Matched observations
-</h2>
-
-<div>
-
-<button onclick="previousPage()">
-Previous
-</button>
-
-<span id="page_info"></span>
-
-<button onclick="nextPage()">
-Next
-</button>
-
+<div class="toolbar">
+    <input id="search" oninput="filterTable()" placeholder="Search filename, ID, date, path...">
+    <label style="font-weight: 500; cursor: pointer;">
+        <input type="checkbox" id="hide-non-live" onchange="filterTable()" checked> Hide non-live marked photos
+    </label>
+    <button class="btn btn-success" onclick="exportNonLiveJSON()">💾 Save Non-Live List (non_live_photos.json)</button>
+    <input type="file" id="import-json" accept=".json" onchange="importNonLiveJSON(event)" style="display:none;">
+    <button class="btn btn-secondary" onclick="document.getElementById('import-json').click()">📁 Load non_live_photos.json</button>
 </div>
 
+<div class="tabs">
+    <button class="tab-btn active" id="tab-unmatched" onclick="switchTab('unmatched')">Unmatched Local Photos ({unmatched_count})</button>
+    <button class="tab-btn" id="tab-matched" onclick="switchTab('matched')">Matched Observations ({matched_count})</button>
+    <button class="tab-btn" id="tab-all" onclick="switchTab('all')">All Photos ({total_count})</button>
+</div>
+
+<div class="pagination">
+    <button class="btn btn-secondary" onclick="previousPage()">Previous</button>
+    <span id="page_info"></span>
+    <button class="btn btn-secondary" onclick="nextPage()">Next</button>
+</div>
+
+<br>
+
 <table id="results">
-
 <thead>
 <tr>
-<th>iNaturalist</th>
-<th>Local</th>
-<th>Thumbnail</th>
-<th>Observation</th>
-<th>Date</th>
+    <th>Status / Filename</th>
+    <th>Thumbnail</th>
+    <th>Path / iNat Details</th>
+    <th>Timestamp / ID</th>
+    <th>Actions</th>
 </tr>
 </thead>
-
 <tbody>
 """)
 
-
-        for r in results:
-
-            if r.get("status") != "MATCHED":
-                continue
-
-            local_images = r.get(
-                "local_images",
-                []
-            )
-
-            for local_path in local_images:
-                local_path = Path(local_path)
-                local_thumb_name = (
-                    local_path.stem
-                    +
-                    ".thumb.jpg"
-                )
-
-                local_thumb_path = (
-                    local_thumb_dir /
-                    local_thumb_name
-                )
-
-
-                create_thumbnail_file(
-                    local_path,
-                    local_thumb_path
-                )
-
-            f.write(
-                "<tr>"
-            )
-
-
-            f.write(
-                "<td>"
-            )
-
-            f.write(
-                esc(
-                    r.get(
-                        "inat_original_filename"
-                    )
-                )
-            )
-
-            f.write(
-                "</td>"
-            )
-
-
-            f.write(
-                "<td>"
-            )
-
-            local_names = [
-                str(Path(p))
-                for p in r.get(
-                    "local_images",
-                    []
-                )
-            ]
-
-            f.write(
-                "<br>".join(
-                    esc(x)
-                    for x in local_names
-                )
-            )
-
-            f.write(
-                "</td>"
-            )
-
-
-            f.write(
-                "<td>"
-            )
-
-            for local_path in r.get(
-                    "local_images",
-                    []):
-
-                local_path = Path(local_path)
-
-                thumb_name = (
-                    local_path.stem
-                    +
-                    ".thumb.jpg"
-                )
-
-                f.write(
-                    f"""
-                    <img src="thumbnails/local/{esc(thumb_name)}">
-                    """
-                )
-
-            f.write(
-                "</td>"
-            )
-
-            f.write(
-                "<td>"
-                +
-                esc(
-                    r.get(
-                        "observation_id"
-                    )
-                )
-                +
-                "</td>"
-            )
-
-
-            f.write(
-                "<td>"
-                +
-                esc(
-                    r.get(
-                        "timestamp"
-                    )
-                )
-                +
-                "</td>"
-            )
-
-
-            f.write(
-                "</tr>"
-            )
-
-
-        f.write(
-            "</tbody></table>"
-        )
-
-        f.write("""
-<h2>
-Local files not in iNaturalist
-</h2>
-
-<table>
-
-<thead>
-<tr>
-<th>Filename</th>
-<th>Thumbnail</th>
-<th>Path</th>
-<th>Timestamp</th>
-</tr>
-</thead>
-
-<tbody>
-""")
-
-
+        # 1. Unmatched Local Photos
         for image in local_missing:
-            thumb_name = (
-                Path(
-                    image["path"]
-                ).stem
-                +
-                ".thumb.jpg"
-            )
+            thumb_name = get_thumbnail_filename(image["path"])
+            thumb_path = local_thumb_dir / thumb_name
+            create_thumbnail_file(image["path"], thumb_path)
 
+            img_path = esc(image.get("path", ""))
+            orig_name = esc(image.get("original_filename", ""))
+            norm_filename = esc(image.get("filename", ""))
+            timestamp = esc(image.get("timestamp", ""))
 
-            thumb_path = (
-                local_thumb_dir /
-                thumb_name
-            )
+            f.write(f'<tr data-matched="false" data-path="{img_path}" data-filename="{norm_filename}">')
+            f.write(f'<td><b>[UNMATCHED]</b><br>{orig_name}<span class="badge-non-live" style="display:none;">Non-Live Creature</span></td>')
+            f.write(f'<td><img src="thumbnails/local/{esc(thumb_name)}"></td>')
+            f.write(f'<td>{img_path}</td>')
+            f.write(f'<td>{timestamp}</td>')
+            f.write(f'<td><button class="btn btn-warning btn-toggle-nonlive" onclick="toggleNonLive(this, \'{img_path}\', \'{norm_filename}\')">🚫 Mark Not Live</button></td>')
+            f.write('</tr>\n')
 
+        # 2. Matched Observations
+        for r in matched_results:
+            local_images = r.get("local_images", [])
+            for local_path in local_images:
+                local_path_obj = Path(local_path)
+                local_thumb_name = get_thumbnail_filename(local_path_obj)
+                local_thumb_path = local_thumb_dir / local_thumb_name
+                create_thumbnail_file(local_path_obj, local_thumb_path)
 
-            create_thumbnail_file(
-                image["path"],
-                thumb_path
-            )
+            local_names = [str(Path(p)) for p in local_images]
+            local_names_html = "<br>".join(esc(x) for x in local_names)
 
-            f.write(
-                "<tr>"
-            )
+            thumbs_html = "".join([
+                f'<img src="thumbnails/local/{esc(get_thumbnail_filename(p))}">'
+                for p in local_images
+            ])
 
-            f.write(
-                "<td>"
-                +
-                esc(
-                    image.get(
-                        "original_filename",
-                        ""
-                    )
-                )
-                +
-                "</td>"
-            )
+            inat_file = esc(r.get("inat_original_filename", ""))
+            obs_id = esc(r.get("observation_id", ""))
+            timestamp = esc(r.get("timestamp", ""))
 
-            f.write(
-                "<td>"
-            )
+            f.write('<tr data-matched="true">')
+            f.write(f'<td><b>[MATCHED]</b><br>{inat_file}</td>')
+            f.write(f'<td>{thumbs_html}</td>')
+            f.write(f'<td><b>Local Files:</b><br>{local_names_html}</td>')
+            f.write(f'<td><b>Obs ID:</b> {obs_id}<br><b>Date:</b> {timestamp}</td>')
+            f.write('<td><span style="color:#28a745; font-weight:bold;">Matched to iNat</span></td>')
+            f.write('</tr>\n')
 
-            f.write(
-                f'<img src="thumbnails/local/{esc(thumb_name)}">'
-            )
-
-            f.write(
-                "</td>"
-            )
-
-            f.write(
-                "<td>"
-                +
-                esc(
-                    image.get(
-                        "path"
-                    )
-                )
-                +
-                "</td>"
-            )
-
-            f.write(
-                "<td>"
-                +
-                esc(
-                    image.get(
-                        "timestamp"
-                    )
-                )
-                +
-                "</td>"
-            )
-
-
-            f.write(
-                "</tr>"
-            )
-
-
-        f.write(
-            """
-</tbody>
+        f.write("""</tbody>
 </table>
 
 </body>
 </html>
-"""
-        )
+""")
+
 
 
 def load_existing_observations(filename):
@@ -1368,164 +1316,84 @@ def extract_exif_datetime(
 
 
 def scan_local_images(
-        folders):
+        folders,
+        use_cache=False,
+        non_live_file="non_live_photos.json"):
 
+    non_live_paths = set()
+    non_live_signatures = set()
+    non_live_filenames = set()
+
+    if non_live_file and os.path.exists(non_live_file):
+        try:
+            nl_data = load_json(non_live_file)
+            if isinstance(nl_data, dict):
+                non_live_paths = {os.path.abspath(p) for p in nl_data.get("paths", [])}
+                non_live_signatures = set(nl_data.get("signatures", []))
+                non_live_filenames = {normalize_filename(f) for f in nl_data.get("filenames", [])}
+            elif isinstance(nl_data, list):
+                non_live_paths = {os.path.abspath(p) for p in nl_data}
+            print(f"Loaded non-live creature exclusions from {non_live_file}.")
+        except Exception as e:
+            print(f"Warning: Failed to load {non_live_file}: {e}")
 
     cache = {}
-
-
-    if os.path.exists(
-        LOCAL_CACHE_FILE
-    ):
-
-        cache = load_json(
-            LOCAL_CACHE_FILE
-        )
-
-
+    if use_cache and os.path.exists(LOCAL_CACHE_FILE):
+        cache = load_json(LOCAL_CACHE_FILE)
 
     images = []
-
-
     updated = False
-
-
+    skipped_non_live = 0
 
     for folder in folders:
-
-
         for root, _, files in os.walk(folder):
-
-
             for filename in files:
-
-
-                path = os.path.join(
-                    root,
-                    filename
-                )
-
-
-                if not is_supported_image(
-                    path
-                ):
-
+                path = os.path.join(root, filename)
+                if not is_supported_image(path):
                     continue
 
+                abs_path = os.path.abspath(path)
+                signature = get_file_signature(path)
+                norm_name = normalize_filename(filename)
 
-
-                signature = get_file_signature(
-                    path
-                )
-
-
-                cached = cache.get(
-                    path
-                )
-
-
-
-                if (
-
-                    cached
-
-                    and
-
-                    cached.get(
-                        "signature"
-                    )
-                    ==
-                    signature
-
-                ):
-
-
-                    images.append(
-                        cached["data"]
-                    )
-
+                if (abs_path in non_live_paths or
+                    path in non_live_paths or
+                    signature in non_live_signatures or
+                    norm_name in non_live_filenames):
+                    skipped_non_live += 1
                     continue
 
+                if use_cache:
+                    cached = cache.get(path)
+                    if cached and cached.get("signature") == signature:
+                        images.append(cached["data"])
+                        continue
 
-
-                # New or changed file
-
-
-                dt = extract_exif_datetime(
-                    path
-                )
-
-
+                dt = extract_exif_datetime(path)
                 data = {
-
-
-                    "path":
-                        path,
-
-
-                    "filename":
-                        normalize_filename(
-                            filename
-                        ),
-
-
-                    "original_filename":
-                        filename,
-
-
-                    "timestamp":
-                        dt.isoformat()
-                        if dt
-                        else None,
-
-
-                    "timestamp_minute":
-                        timestamp_minute(
-                            dt
-                        )
-
+                    "path": path,
+                    "filename": norm_name,
+                    "original_filename": filename,
+                    "timestamp": dt.isoformat() if dt else None,
+                    "timestamp_minute": timestamp_minute(dt)
                 }
 
+                if use_cache:
+                    cache[path] = {
+                        "signature": signature,
+                        "data": data
+                    }
+                    updated = True
 
+                images.append(data)
 
-                cache[path] = {
+    if use_cache and updated:
+        save_json(LOCAL_CACHE_FILE, cache)
 
+    if skipped_non_live > 0:
+        print(f"Skipped {skipped_non_live} local photos marked as non-live creatures.")
 
-                    "signature":
-                        signature,
-
-
-                    "data":
-                        data
-
-                }
-
-
-
-                images.append(
-                    data
-                )
-
-
-                updated = True
-
-
-
-    if updated:
-
-        save_json(
-            LOCAL_CACHE_FILE,
-            cache
-        )
-
-
-
-    print(
-        "Local images indexed:",
-        len(images)
-    )
-
-
+    print("Local images indexed:", len(images))
     return images
 
 
@@ -2453,6 +2321,18 @@ def main():
         help="iNaturalist exported observation IDs file"
     )
 
+    parser.add_argument(
+        "--use-cache",
+        action="store_true",
+        help="Enable local photos caching (disabled by default)"
+    )
+
+    parser.add_argument(
+        "--non-live-file",
+        default="non_live_photos.json",
+        help="JSON file containing list of non-live creature photos to skip scanning"
+    )
+
 
     args = parser.parse_args()
     global DEBUG_MODE
@@ -2563,9 +2443,9 @@ def main():
 
 
     local_images = scan_local_images(
-
-        args.folders
-
+        args.folders,
+        use_cache=args.use_cache,
+        non_live_file=args.non_live_file
     )
 
 

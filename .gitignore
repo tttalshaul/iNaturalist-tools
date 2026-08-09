@@ -2,3 +2,4 @@ local_image_cache.json
 observations.json
 token.txt
 observations-*.csv
+inat_comparison/
