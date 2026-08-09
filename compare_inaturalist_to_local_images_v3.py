@@ -703,8 +703,6 @@ function filterTable() {{
 
         row.dataset.hidden = !(matchesTab && matchesSearch && matchesNonLiveFilter);
     }});
-
-    showPage(0);
 }}
 
 function showPage(page) {{
