@@ -842,6 +842,14 @@ window.onload = function() {{
         f.write("""</tbody>
 </table>
 
+<br>
+
+<div class="pagination">
+    <button class="btn btn-secondary" onclick="previousPage()">Previous</button>
+    <span id="page_info"></span>
+    <button class="btn btn-secondary" onclick="nextPage()">Next</button>
+</div>
+
 </body>
 </html>
 """)
