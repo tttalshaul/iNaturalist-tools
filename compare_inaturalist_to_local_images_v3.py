@@ -807,7 +807,7 @@ window.onload = function() {{
             f.write(f'<td><img src="thumbnails/local/{esc(thumb_name)}"></td>')
             f.write(f'<td>{img_path}</td>')
             f.write(f'<td>{timestamp}</td>')
-            f.write(f'<td><button class="btn btn-warning btn-toggle-nonlive" onclick="toggleNonLive(this, \'{img_path}\', \'{norm_filename}\')">🚫 Mark Not Live</button></td>')
+            f.write(f'<td><button class="btn btn-warning btn-toggle-nonlive" onclick="toggleNonLive(this, \'{html.escape(img_path)}\', \'{norm_filename}\')">🚫 Mark Not Live</button></td>')
             f.write('</tr>\n')
 
         # 2. Matched Observations
