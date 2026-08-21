@@ -940,6 +940,8 @@ def fetch_observations(
 
                         "photos.original_filename",
 
+                        "taxon.id",
+
                     ]
                 )
 
