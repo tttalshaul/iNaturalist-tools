@@ -1503,7 +1503,7 @@ def match_single_photo(
 
 
     candidates = filename_index.get(
-        filename,
+        normalize_filename(filename),
         []
     )
 

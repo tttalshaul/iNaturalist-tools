@@ -1,11 +1,7 @@
 *.pyc
+*.json
+*.csv
+*.txt
+*.html
 __pycache__/
-local_image_cache.json
-observations.json
-token.txt
-observations-*.csv
-non_live_photos.json
-israel_moths_*.csv
-israel_only_moths_*.csv
-world_moths_*.csv
 inat_comparison/
