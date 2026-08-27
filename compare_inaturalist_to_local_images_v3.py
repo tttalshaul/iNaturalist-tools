@@ -303,7 +303,8 @@ def normalize_filename(
         os.path.basename(filename)
     )[0].lower()
 
-    name = name.replace("_", " ").replace("-", " ")
+    for ch in ["_", "-", ",", ".", ";", ":"]:
+        name = name.replace(ch, " ")
     return " ".join(name.split())
 
 
@@ -320,6 +321,32 @@ def timestamp_minute(
     return dt.strftime(
         "%Y-%m-%d %H:%M"
     )
+
+import re
+
+def parse_date_from_path(path):
+    if not path:
+        return None
+    m = re.search(r"(\d{4})[-_.](\d{1,2})[-_.](\d{1,2})", path)
+    if m:
+        try:
+            return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+        except Exception:
+            pass
+    m = re.search(r"(?:^|[^\d])(\d{1,2})[.](\d{1,2})[.](\d{2,4})(?:$|[^\d])", path)
+    if m:
+        d, m_num, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if y < 100:
+            y += 2000
+        if 1 <= m_num <= 12 and 1 <= d <= 31:
+            return f"{y:04d}-{m_num:02d}-{d:02d}"
+    return None
+
+def get_candidate_date(candidate):
+    ts = candidate.get("timestamp")
+    if ts and len(ts) >= 10:
+        return ts[:10]
+    return parse_date_from_path(candidate.get("path"))
 
 from PIL import Image
 
@@ -397,10 +424,41 @@ def esc(value):
     )
 
 
+def sort_items(items, sort_by="date", sort_order="asc", group_by_dir=True, item_type="unmatched"):
+    def sort_key(item):
+        if item_type == "unmatched":
+            path = item.get("path", "")
+            dir_path = str(Path(path).parent).lower() if path else ""
+            fname = (item.get("original_filename") or item.get("filename") or "").lower()
+            ts = item.get("timestamp") or ""
+        else:
+            local_imgs = item.get("local_images", [])
+            path = local_imgs[0] if local_imgs else ""
+            dir_path = str(Path(path).parent).lower() if path else ""
+            fname = (item.get("inat_original_filename") or "").lower()
+            ts = item.get("timestamp") or ""
+
+        dir_k = dir_path if group_by_dir else ""
+        if sort_by == "filename":
+            val_k = fname
+        elif sort_by == "dir":
+            val_k = dir_path
+        else:
+            val_k = ts if ts else ("0000-00-00" if sort_order == "desc" else "9999-99-99")
+
+        return (dir_k, val_k, fname)
+
+    reverse = (sort_order == "desc")
+    return sorted(items, key=sort_key, reverse=reverse)
+
+
 def create_html_report(
         results,
         local_missing,
-        output_dir):
+        output_dir,
+        sort_by="date",
+        sort_order="asc",
+        group_by_dir=True):
 
     output_dir = Path(output_dir)
     thumb_dir = output_dir / "thumbnails"
@@ -412,9 +470,21 @@ def create_html_report(
     html_file = output_dir / "report.html"
 
     matched_results = [r for r in results if r.get("status") == "MATCHED"]
+    matched_results = sort_items(matched_results, sort_by=sort_by, sort_order=sort_order, group_by_dir=group_by_dir, item_type="matched")
+    local_missing = sort_items(local_missing, sort_by=sort_by, sort_order=sort_order, group_by_dir=group_by_dir, item_type="unmatched")
+
     matched_count = len(matched_results)
     unmatched_count = len(local_missing)
     total_count = matched_count + unmatched_count
+
+    sort_by_date_sel = 'selected' if sort_by == 'date' else ''
+    sort_by_fn_sel = 'selected' if sort_by == 'filename' else ''
+    sort_by_dir_sel = 'selected' if sort_by == 'dir' else ''
+
+    sort_asc_sel = 'selected' if sort_order == 'asc' else ''
+    sort_desc_sel = 'selected' if sort_order == 'desc' else ''
+
+    group_by_dir_chk = 'checked' if group_by_dir else ''
 
     with open(html_file, "w", encoding="utf-8") as f:
         f.write(f"""<!DOCTYPE html>
@@ -449,7 +519,15 @@ h1 {{
     font-size: 15px;
     border: 1px solid #ccc;
     border-radius: 6px;
-    width: 320px;
+    width: 260px;
+}}
+.toolbar select {{
+    padding: 8px 12px;
+    font-size: 14px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    background: #fff;
+    cursor: pointer;
 }}
 .btn {{
     padding: 8px 14px;
@@ -588,27 +666,41 @@ function saveNonLiveStore() {{
 }}
 
 function toggleNonLive(btn, path, filename, signature) {{
-    let row = btn.closest("tr");
-    let isNonLive = nonLivePaths.has(path) || (filename && nonLiveFilenames.has(filename));
+    let row = btn ? btn.closest("tr") : null;
+    if (!path && row && row.dataset.path) path = row.dataset.path;
+    if (!filename && row && row.dataset.filename) filename = row.dataset.filename;
+    if (!signature && row && row.dataset.signature) signature = row.dataset.signature;
+
+    let isNonLive = (path && nonLivePaths.has(path)) || 
+                    (filename && nonLiveFilenames.has(filename)) || 
+                    (signature && nonLiveSignatures.has(signature));
 
     if (isNonLive) {{
         if (path) nonLivePaths.delete(path);
         if (filename) nonLiveFilenames.delete(filename);
         if (signature) nonLiveSignatures.delete(signature);
-        row.classList.remove("non-live-row");
-        btn.innerText = "🚫 Mark Not Live";
-        btn.className = "btn btn-warning btn-toggle-nonlive";
-        let badge = row.querySelector(".badge-non-live");
-        if (badge) badge.style.display = "none";
+        if (row) {{
+            row.classList.remove("non-live-row");
+            let badge = row.querySelector(".badge-non-live");
+            if (badge) badge.style.display = "none";
+        }}
+        if (btn) {{
+            btn.innerText = "🚫 Mark Not Live";
+            btn.className = "btn btn-warning btn-toggle-nonlive";
+        }}
     }} else {{
         if (path) nonLivePaths.add(path);
         if (filename) nonLiveFilenames.add(filename);
         if (signature) nonLiveSignatures.add(signature);
-        row.classList.add("non-live-row");
-        btn.innerText = "🌱 Mark as Live";
-        btn.className = "btn btn-secondary btn-toggle-nonlive";
-        let badge = row.querySelector(".badge-non-live");
-        if (badge) badge.style.display = "inline-block";
+        if (row) {{
+            row.classList.add("non-live-row");
+            let badge = row.querySelector(".badge-non-live");
+            if (badge) badge.style.display = "inline-block";
+        }}
+        if (btn) {{
+            btn.innerText = "🌱 Mark as Live";
+            btn.className = "btn btn-secondary btn-toggle-nonlive";
+        }}
     }}
     saveNonLiveStore();
     filterTable();
@@ -678,6 +770,64 @@ function switchTab(tab) {{
     let activeBtn = document.getElementById("tab-" + tab);
     if (activeBtn) activeBtn.classList.add("active");
     filterTable();
+}}
+
+function onSortChange() {{
+    sortTable();
+    filterTable();
+}}
+
+function sortTable() {{
+    let tbody = document.querySelector("#results tbody");
+    if (!tbody) return;
+    let rows = Array.from(tbody.querySelectorAll("tr"));
+
+    let sortBy = document.getElementById("sort-by").value;
+    let sortOrder = document.getElementById("sort-order").value;
+    let groupByDir = document.getElementById("group-by-dir").checked;
+
+    rows.sort(function(a, b) {{
+        let dirA = (a.dataset.dir || "").toLowerCase();
+        let dirB = (b.dataset.dir || "").toLowerCase();
+
+        let fileA = (a.dataset.filename || "").toLowerCase();
+        let fileB = (b.dataset.filename || "").toLowerCase();
+
+        let dateA = a.dataset.timestamp || "";
+        let dateB = b.dataset.timestamp || "";
+
+        if (groupByDir) {{
+            let dirCmp = dirA.localeCompare(dirB);
+            if (dirCmp !== 0) return dirCmp;
+        }}
+
+        let cmp = 0;
+        if (sortBy === "filename") {{
+            cmp = fileA.localeCompare(fileB);
+        }} else if (sortBy === "date") {{
+            if (!dateA && !dateB) cmp = 0;
+            else if (!dateA) return 1;
+            else if (!dateB) return -1;
+            else cmp = dateA.localeCompare(dateB);
+        }} else if (sortBy === "dir") {{
+            cmp = dirA.localeCompare(dirB);
+        }}
+
+        if (sortOrder === "desc") {{
+            cmp = -cmp;
+        }}
+
+        if (cmp === 0) {{
+            cmp = fileA.localeCompare(fileB);
+        }}
+        return cmp;
+    }});
+
+    let fragment = document.createDocumentFragment();
+    rows.forEach(function(row) {{
+        fragment.appendChild(row);
+    }});
+    tbody.appendChild(fragment);
 }}
 
 function filterTable() {{
@@ -756,7 +906,29 @@ window.onload = function() {{
 
 <div class="toolbar">
     <input id="search" oninput="filterTable()" placeholder="Search filename, ID, date, path...">
-    <label style="font-weight: 500; cursor: pointer;">
+    
+    <label style="font-weight: 500; display: flex; align-items: center; gap: 5px;">
+        Sort by:
+        <select id="sort-by" onchange="onSortChange()">
+            <option value="date" {sort_by_date_sel}>Date / Time</option>
+            <option value="filename" {sort_by_fn_sel}>Filename</option>
+            <option value="dir" {sort_by_dir_sel}>Directory Path</option>
+        </select>
+    </label>
+
+    <label style="font-weight: 500; display: flex; align-items: center; gap: 5px;">
+        Order:
+        <select id="sort-order" onchange="onSortChange()">
+            <option value="asc" {sort_asc_sel}>Ascending ⬆</option>
+            <option value="desc" {sort_desc_sel}>Descending ⬇</option>
+        </select>
+    </label>
+
+    <label style="font-weight: 500; cursor: pointer; display: flex; align-items: center; gap: 5px;">
+        <input type="checkbox" id="group-by-dir" onchange="onSortChange()" {group_by_dir_chk}> Group by Directory
+    </label>
+
+    <label style="font-weight: 500; cursor: pointer; display: flex; align-items: center; gap: 5px;">
         <input type="checkbox" id="hide-non-live" onchange="filterTable()" checked> Hide non-live marked photos
     </label>
     <button class="btn btn-success" onclick="exportNonLiveJSON()">💾 Save Non-Live List (non_live_photos.json)</button>
@@ -798,16 +970,17 @@ window.onload = function() {{
             create_thumbnail_file(image["path"], thumb_path)
 
             img_path = esc(image.get("path", ""))
+            dir_path = esc(str(Path(image.get("path", "")).parent))
             orig_name = esc(image.get("original_filename", ""))
             norm_filename = esc(image.get("filename", ""))
             timestamp = esc(image.get("timestamp", ""))
 
-            f.write(f'<tr data-matched="false" data-path="{img_path}" data-filename="{norm_filename}">')
+            f.write(f'<tr data-matched="false" data-path="{img_path}" data-dir="{dir_path}" data-filename="{orig_name}" data-timestamp="{timestamp}">')
             f.write(f'<td><b>[UNMATCHED]</b><br>{orig_name}<span class="badge-non-live" style="display:none;">Non-Live Creature</span></td>')
             f.write(f'<td><img src="thumbnails/local/{esc(thumb_name)}"></td>')
             f.write(f'<td>{img_path}</td>')
             f.write(f'<td>{timestamp}</td>')
-            f.write(f'<td><button class="btn btn-warning btn-toggle-nonlive" onclick="toggleNonLive(this, \'{html.escape(img_path)}\', \'{norm_filename}\')">🚫 Mark Not Live</button></td>')
+            f.write('<td><button class="btn btn-warning btn-toggle-nonlive" onclick="toggleNonLive(this)">🚫 Mark Not Live</button></td>')
             f.write('</tr>\n')
 
         # 2. Matched Observations
@@ -831,7 +1004,10 @@ window.onload = function() {{
             obs_id = esc(r.get("observation_id", ""))
             timestamp = esc(r.get("timestamp", ""))
 
-            f.write('<tr data-matched="true">')
+            first_path = local_images[0] if local_images else ""
+            dir_path = esc(str(Path(first_path).parent)) if first_path else ""
+
+            f.write(f'<tr data-matched="true" data-path="{esc(first_path)}" data-dir="{dir_path}" data-filename="{inat_file}" data-timestamp="{timestamp}">')
             f.write(f'<td><b>[MATCHED]</b><br>{inat_file}</td>')
             f.write(f'<td>{thumbs_html}</td>')
             f.write(f'<td><b>Local Files:</b><br>{local_names_html}</td>')
@@ -1379,15 +1555,18 @@ def scan_local_images(
 
                 if (abs_path in non_live_paths or
                     path in non_live_paths or
-                    sig_key in non_live_signatures or
-                    norm_name in non_live_filenames):
+                    sig_key in non_live_signatures):
                     skipped_non_live += 1
                     continue
 
                 if use_cache:
                     cached = cache.get(path)
                     if cached and cached.get("signature") == signature:
-                        images.append(cached["data"])
+                        data = cached["data"]
+                        if data.get("filename") != norm_name:
+                            data["filename"] = norm_name
+                            updated = True
+                        images.append(data)
                         continue
 
                 dt = extract_exif_datetime(path)
@@ -1559,78 +1738,85 @@ def match_single_photo(
     # --------------------------------------------------
 
 
-    inat_time = timestamp_minute(
-        inat_photo.get(
-            "timestamp"
-        )
-    )
-
-
+    inat_dt = inat_photo.get("timestamp")
+    inat_time = timestamp_minute(inat_dt)
 
     if inat_time:
-
-
         timestamp_matches = []
-
-
         for candidate in candidates:
-
-
-            if (
-                candidate.get(
-                    "timestamp_minute"
-                )
-                ==
-                inat_time
-            ):
-
-
-                timestamp_matches.append(
-                    candidate
-                )
-
-
+            if candidate.get("timestamp_minute") == inat_time:
+                timestamp_matches.append(candidate)
 
         if len(timestamp_matches) == 1:
-
-
             return {
-
-
-                "status":
-                    "MATCHED",
-
-
-                "local_image":
-                    timestamp_matches[0],
-
-
-                "match_method":
-                    "filename+timestamp"
-
-
+                "status": "MATCHED",
+                "local_image": timestamp_matches[0],
+                "match_method": "filename+timestamp"
             }
-
-
-
         elif len(timestamp_matches) > 1:
-
-
             return {
-
-
-                "status":
-                    "AMBIGUOUS_TIMESTAMP",
-
-
-                "local_image":
-                    timestamp_matches,
-
-
-                "match_method":
-                    None
-
+                "status": "AMBIGUOUS_TIMESTAMP",
+                "local_image": timestamp_matches,
+                "match_method": None
             }
+
+        # Fallback: Timezone/DST shift tolerance (within +/- 2 hours) or same date match
+        if inat_dt:
+            near_matches = []
+            for candidate in candidates:
+                cand_ts_str = candidate.get("timestamp")
+                if cand_ts_str:
+                    try:
+                        cand_dt = datetime.fromisoformat(cand_ts_str)
+                        diff = abs((cand_dt - inat_dt).total_seconds())
+                        if diff <= 7200:  # within 2 hours (1-2 hr timezone/DST shift)
+                            near_matches.append(candidate)
+                    except Exception:
+                        pass
+
+            if len(near_matches) == 1:
+                return {
+                    "status": "MATCHED",
+                    "local_image": near_matches[0],
+                    "match_method": "filename+near_timestamp"
+                }
+
+            # Fallback: Same date match (using EXIF timestamp or folder path date)
+            inat_date_str = inat_dt.strftime("%Y-%m-%d")
+            date_matches = [
+                c for c in candidates
+                if get_candidate_date(c) == inat_date_str
+            ]
+            if len(date_matches) == 1:
+                return {
+                    "status": "MATCHED",
+                    "local_image": date_matches[0],
+                    "match_method": "filename+same_date"
+                }
+
+            # Fallback: Closest timestamp match if best candidate is within 48h and significantly closer than others
+            cand_diffs = []
+            for candidate in candidates:
+                cand_ts_str = candidate.get("timestamp")
+                if cand_ts_str:
+                    try:
+                        cand_dt = datetime.fromisoformat(cand_ts_str)
+                        diff_seconds = abs((cand_dt - inat_dt).total_seconds())
+                        cand_diffs.append((diff_seconds, candidate))
+                    except Exception:
+                        pass
+
+            if cand_diffs:
+                cand_diffs.sort(key=lambda x: x[0])
+                best_diff, best_cand = cand_diffs[0]
+                second_best_diff = cand_diffs[1][0] if len(cand_diffs) > 1 else float("inf")
+                # If best match is within 48h and at least 12h closer than the next best candidate
+                if best_diff <= 172800 and (second_best_diff - best_diff >= 43200):
+                    return {
+                        "status": "MATCHED",
+                        "local_image": best_cand,
+                        "match_method": "filename+closest_timestamp"
+                    }
 
 
 
@@ -2357,6 +2543,26 @@ def main():
         help="JSON file containing list of non-live creature photos to skip scanning"
     )
 
+    parser.add_argument(
+        "--sort-by",
+        choices=["date", "filename", "dir"],
+        default="date",
+        help="Default sorting criterion for HTML report (date, filename, dir)"
+    )
+
+    parser.add_argument(
+        "--sort-order",
+        choices=["asc", "desc"],
+        default="asc",
+        help="Default sorting order for HTML report (asc, desc)"
+    )
+
+    parser.add_argument(
+        "--no-group-by-dir",
+        action="store_true",
+        help="Disable grouping by directory in default HTML report sorting"
+    )
+
 
     args = parser.parse_args()
     global DEBUG_MODE
@@ -2549,7 +2755,10 @@ def main():
     create_html_report(
         results,
         local_missing,
-        args.output_dir
+        args.output_dir,
+        sort_by=args.sort_by,
+        sort_order=args.sort_order,
+        group_by_dir=not args.no_group_by_dir
     )
 
 
