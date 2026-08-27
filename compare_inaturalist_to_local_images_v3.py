@@ -477,6 +477,29 @@ def create_html_report(
     unmatched_count = len(local_missing)
     total_count = matched_count + unmatched_count
 
+    camera_types = set()
+    camera_names = set()
+    for image in local_missing:
+        if image.get("camera_type"):
+            camera_types.add(image["camera_type"])
+        if image.get("camera_name"):
+            camera_names.add(image["camera_name"])
+    for result in matched_results:
+        for image in result.get("local_image_data", []):
+            if image.get("camera_type"):
+                camera_types.add(image["camera_type"])
+            if image.get("camera_name"):
+                camera_names.add(image["camera_name"])
+
+    camera_type_options = "".join(
+        f'<option value="{esc(value)}">{esc(value)}</option>'
+        for value in sorted(camera_types, key=str.casefold)
+    )
+    camera_name_options = "".join(
+        f'<option value="{esc(value)}">{esc(value)}</option>'
+        for value in sorted(camera_names, key=str.casefold)
+    )
+
     sort_by_date_sel = 'selected' if sort_by == 'date' else ''
     sort_by_fn_sel = 'selected' if sort_by == 'filename' else ''
     sort_by_dir_sel = 'selected' if sort_by == 'dir' else ''
@@ -833,6 +856,8 @@ function sortTable() {{
 function filterTable() {{
     let text = document.getElementById("search").value.toLowerCase();
     let hideNonLive = document.getElementById("hide-non-live").checked;
+    let selectedCameraTypes = Array.from(document.getElementById("camera-type-filter").selectedOptions).map(option => option.value);
+    let selectedCameraNames = Array.from(document.getElementById("camera-name-filter").selectedOptions).map(option => option.value);
     let rows = document.querySelectorAll("#results tbody tr");
 
     rows.forEach(function(row) {{
@@ -850,8 +875,12 @@ function filterTable() {{
 
         let matchesSearch = !text || row.innerText.toLowerCase().includes(text);
         let matchesNonLiveFilter = !hideNonLive || !isNonLive;
+        let rowCameraTypes = JSON.parse(row.dataset.cameraTypes || "[]");
+        let rowCameraNames = JSON.parse(row.dataset.cameraNames || "[]");
+        let matchesCameraType = !selectedCameraTypes.length || selectedCameraTypes.some(value => rowCameraTypes.includes(value));
+        let matchesCameraName = !selectedCameraNames.length || selectedCameraNames.some(value => rowCameraNames.includes(value));
 
-        row.dataset.hidden = !(matchesTab && matchesSearch && matchesNonLiveFilter);
+        row.dataset.hidden = !(matchesTab && matchesSearch && matchesNonLiveFilter && matchesCameraType && matchesCameraName);
     }});
 
     showPage(currentPage);
@@ -906,6 +935,20 @@ window.onload = function() {{
 
 <div class="toolbar">
     <input id="search" oninput="filterTable()" placeholder="Search filename, ID, date, path...">
+
+    <label style="font-weight: 500; display: flex; align-items: center; gap: 5px;">
+        Camera type:
+        <select id="camera-type-filter" multiple size="3" onchange="filterTable()">
+            {camera_type_options}
+        </select>
+    </label>
+
+    <label style="font-weight: 500; display: flex; align-items: center; gap: 5px;">
+        Camera name:
+        <select id="camera-name-filter" multiple size="3" onchange="filterTable()">
+            {camera_name_options}
+        </select>
+    </label>
     
     <label style="font-weight: 500; display: flex; align-items: center; gap: 5px;">
         Sort by:
@@ -974,8 +1017,10 @@ window.onload = function() {{
             orig_name = esc(image.get("original_filename", ""))
             norm_filename = esc(image.get("filename", ""))
             timestamp = esc(image.get("timestamp", ""))
+            camera_types_json = esc(json.dumps([image["camera_type"]] if image.get("camera_type") else []))
+            camera_names_json = esc(json.dumps([image["camera_name"]] if image.get("camera_name") else []))
 
-            f.write(f'<tr data-matched="false" data-path="{img_path}" data-dir="{dir_path}" data-filename="{orig_name}" data-timestamp="{timestamp}">')
+            f.write(f'<tr data-matched="false" data-path="{img_path}" data-dir="{dir_path}" data-filename="{orig_name}" data-timestamp="{timestamp}" data-camera-types="{camera_types_json}" data-camera-names="{camera_names_json}">')
             f.write(f'<td><b>[UNMATCHED]</b><br>{orig_name}<span class="badge-non-live" style="display:none;">Non-Live Creature</span></td>')
             f.write(f'<td><img src="thumbnails/local/{esc(thumb_name)}"></td>')
             f.write(f'<td>{img_path}</td>')
@@ -994,6 +1039,11 @@ window.onload = function() {{
 
             local_names = [str(Path(p)) for p in local_images]
             local_names_html = "<br>".join(esc(x) for x in local_names)
+            local_image_data = r.get("local_image_data", [])
+            row_camera_types = sorted({image.get("camera_type") for image in local_image_data if image.get("camera_type")}, key=str.casefold)
+            row_camera_names = sorted({image.get("camera_name") for image in local_image_data if image.get("camera_name")}, key=str.casefold)
+            camera_types_json = esc(json.dumps(row_camera_types))
+            camera_names_json = esc(json.dumps(row_camera_names))
 
             thumbs_html = "".join([
                 f'<img src="thumbnails/local/{esc(get_thumbnail_filename(p))}">'
@@ -1007,7 +1057,7 @@ window.onload = function() {{
             first_path = local_images[0] if local_images else ""
             dir_path = esc(str(Path(first_path).parent)) if first_path else ""
 
-            f.write(f'<tr data-matched="true" data-path="{esc(first_path)}" data-dir="{dir_path}" data-filename="{inat_file}" data-timestamp="{timestamp}">')
+            f.write(f'<tr data-matched="true" data-path="{esc(first_path)}" data-dir="{dir_path}" data-filename="{inat_file}" data-timestamp="{timestamp}" data-camera-types="{camera_types_json}" data-camera-names="{camera_names_json}">')
             f.write(f'<td><b>[MATCHED]</b><br>{inat_file}</td>')
             f.write(f'<td>{thumbs_html}</td>')
             f.write(f'<td><b>Local Files:</b><br>{local_names_html}</td>')
@@ -1503,6 +1553,27 @@ def extract_exif_datetime(
     return None
 
 
+def extract_exif_camera(
+        path):
+
+    try:
+        img = Image.open(path)
+        exif = img.getexif()
+        values = {ExifTags.TAGS.get(key): value for key, value in exif.items()}
+
+        def clean(value):
+            if isinstance(value, bytes):
+                value = value.decode("utf-8", errors="replace")
+            return str(value).strip() if value else None
+
+        return {
+            "camera_type": clean(values.get("Make")),
+            "camera_name": clean(values.get("Model"))
+        }
+    except Exception:
+        return {"camera_type": None, "camera_name": None}
+
+
 
 def scan_local_images(
         folders,
@@ -1563,6 +1634,9 @@ def scan_local_images(
                     cached = cache.get(path)
                     if cached and cached.get("signature") == signature:
                         data = cached["data"]
+                        if "camera_type" not in data or "camera_name" not in data:
+                            data.update(extract_exif_camera(path))
+                            updated = True
                         if data.get("filename") != norm_name:
                             data["filename"] = norm_name
                             updated = True
@@ -1570,6 +1644,7 @@ def scan_local_images(
                         continue
 
                 dt = extract_exif_datetime(path)
+                camera = extract_exif_camera(path)
                 data = {
                     "path": path,
                     "filename": norm_name,
@@ -1577,6 +1652,7 @@ def scan_local_images(
                     "timestamp": dt.isoformat() if dt else None,
                     "timestamp_minute": timestamp_minute(dt)
                 }
+                data.update(camera)
 
                 if use_cache:
                     cache[path] = {
@@ -1902,6 +1978,8 @@ def compare_photos(
 
             local_paths = []
 
+        local_image_data = local if isinstance(local, list) else ([local] if local else [])
+
 
 
         results.append(
@@ -1934,6 +2012,9 @@ def compare_photos(
 
                 "local_images":
                     local_paths,
+
+                "local_image_data":
+                    local_image_data,
 
 
                 "status":
