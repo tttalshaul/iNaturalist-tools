@@ -15,6 +15,12 @@ from datetime import datetime
 
 import requests
 
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - optional dependency fallback
+    def tqdm(iterable=None, **kwargs):
+        return iterable if iterable is not None else []
+
 from PIL import Image, ExifTags, ImageFile, ImageFilter, ImageStat
 
 from openpyxl import Workbook
@@ -1738,60 +1744,62 @@ def scan_local_images(
     images = []
     updated = False
     skipped_non_live = 0
-
+    image_files = []
     for folder in folders:
         for root, _, files in os.walk(folder):
             for filename in files:
                 path = os.path.join(root, filename)
-                if not is_supported_image(path):
-                    continue
+                if is_supported_image(path):
+                    image_files.append(path)
 
-                abs_path = os.path.abspath(path)
-                signature = get_file_signature(path)
-                sig_key = (signature.get("size"), signature.get("mtime"))
-                norm_name = normalize_filename(filename)
+    for path in tqdm(image_files, desc="Checking heuristics", unit="image"):
+        filename = os.path.basename(path)
+        abs_path = os.path.abspath(path)
+        signature = get_file_signature(path)
+        sig_key = (signature.get("size"), signature.get("mtime"))
+        norm_name = normalize_filename(filename)
 
-                if (abs_path in non_live_paths or
-                    path in non_live_paths or
-                    sig_key in non_live_signatures):
-                    skipped_non_live += 1
-                    continue
+        if (abs_path in non_live_paths or
+            path in non_live_paths or
+            sig_key in non_live_signatures):
+            skipped_non_live += 1
+            continue
 
-                if use_cache:
-                    cached = cache.get(path)
-                    if cached and cached.get("signature") == signature:
-                        data = cached["data"]
-                        if "camera_type" not in data or "camera_name" not in data:
-                            data.update(extract_exif_camera(path))
-                            updated = True
-                        if data.get("filename") != norm_name:
-                            data["filename"] = norm_name
-                            updated = True
-                        images.append(data)
-                        continue
-
-                dt = extract_exif_datetime(path)
-                camera = extract_exif_camera(path)
-                flags = detect_photo_flags(path)
-                data = {
-                    "path": path,
-                    "filename": norm_name,
-                    "original_filename": filename,
-                    "timestamp": dt.isoformat() if dt else None,
-                    "timestamp_minute": timestamp_minute(dt),
-                    "human": flags.get("human", False),
-                    "landscape": flags.get("landscape", False)
-                }
-                data.update(camera)
-
-                if use_cache:
-                    cache[path] = {
-                        "signature": signature,
-                        "data": data
-                    }
+        if use_cache:
+            cached = cache.get(path)
+            if cached and cached.get("signature") == signature:
+                data = cached["data"]
+                if "camera_type" not in data or "camera_name" not in data:
+                    data.update(extract_exif_camera(path))
                     updated = True
-
+                if data.get("filename") != norm_name:
+                    data["filename"] = norm_name
+                    updated = True
                 images.append(data)
+                continue
+
+        dt = extract_exif_datetime(path)
+        camera = extract_exif_camera(path)
+        flags = detect_photo_flags(path)
+        data = {
+            "path": path,
+            "filename": norm_name,
+            "original_filename": filename,
+            "timestamp": dt.isoformat() if dt else None,
+            "timestamp_minute": timestamp_minute(dt),
+            "human": flags.get("human", False),
+            "landscape": flags.get("landscape", False)
+        }
+        data.update(camera)
+
+        if use_cache:
+            cache[path] = {
+                "signature": signature,
+                "data": data
+            }
+            updated = True
+
+        images.append(data)
 
     if use_cache and updated:
         save_json(LOCAL_CACHE_FILE, cache)
@@ -2061,11 +2069,7 @@ def compare_photos(
 
     results = []
 
-
-
-    for photo in inat_photos:
-
-
+    for photo in tqdm(inat_photos, desc="Matching iNat photos", unit="photo"):
         result = match_single_photo(
             photo,
             filename_index
