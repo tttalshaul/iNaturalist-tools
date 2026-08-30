@@ -15,7 +15,7 @@ from datetime import datetime
 
 import requests
 
-from PIL import Image, ExifTags, ImageFile
+from PIL import Image, ExifTags, ImageFile, ImageFilter, ImageStat
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
@@ -491,6 +491,45 @@ def create_html_report(
             if image.get("camera_name"):
                 camera_names.add(image["camera_name"])
 
+    badge_css = '''
+    .badge-human {{
+        display: inline-block;
+        padding: 4px 8px;
+        font-size: 12px;
+        font-weight: bold;
+        color: #0b3d91;
+        background-color: #d9ecff;
+        border: 1px solid #b8d8ff;
+        border-radius: 4px;
+        margin-left: 8px;
+        margin-top: 4px;
+    }}
+    .badge-landscape {{
+        display: inline-block;
+        padding: 4px 8px;
+        font-size: 12px;
+        font-weight: bold;
+        color: #1f4d2e;
+        background-color: #dff3d8;
+        border: 1px solid #bfe4b7;
+        border-radius: 4px;
+        margin-left: 8px;
+        margin-top: 4px;
+    }}
+    .badge-non-live {{
+        display: inline-block;
+        padding: 4px 8px;
+        font-size: 12px;
+        font-weight: bold;
+        color: #856404;
+        background-color: #ffeeba;
+        border: 1px solid #ffe8a1;
+        border-radius: 4px;
+        margin-left: 8px;
+        margin-top: 4px;
+    }}
+    '''
+
     camera_type_options = "".join(
         f'<option value="{esc(value)}">{esc(value)}</option>'
         for value in sorted(camera_types, key=str.casefold)
@@ -516,6 +555,7 @@ def create_html_report(
 <meta charset="utf-8">
 <title>iNaturalist comparison</title>
 <style>
+{badge_css}
 body {{
     font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     margin: 20px;
@@ -856,6 +896,7 @@ function sortTable() {{
 function filterTable() {{
     let text = document.getElementById("search").value.toLowerCase();
     let hideNonLive = document.getElementById("hide-non-live").checked;
+    let flagFilter = document.getElementById("flag-filter").value;
     let selectedCameraTypes = Array.from(document.getElementById("camera-type-filter").selectedOptions).map(option => option.value);
     let selectedCameraNames = Array.from(document.getElementById("camera-name-filter").selectedOptions).map(option => option.value);
     let rows = document.querySelectorAll("#results tbody tr");
@@ -863,6 +904,9 @@ function filterTable() {{
     rows.forEach(function(row) {{
         let isMatched = row.dataset.matched === "true";
         let isNonLive = row.classList.contains("non-live-row");
+        let isHuman = row.dataset.human === "true";
+        let isLandscape = row.dataset.landscape === "true";
+        let isFlagged = isHuman || isLandscape;
 
         let matchesTab = false;
         if (currentTab === "all") {{
@@ -875,12 +919,18 @@ function filterTable() {{
 
         let matchesSearch = !text || row.innerText.toLowerCase().includes(text);
         let matchesNonLiveFilter = !hideNonLive || !isNonLive;
+        let matchesFlagFilter = true;
+        if (flagFilter === "flagged") matchesFlagFilter = isFlagged;
+        else if (flagFilter === "human") matchesFlagFilter = isHuman;
+        else if (flagFilter === "landscape") matchesFlagFilter = isLandscape;
+        else if (flagFilter === "unflagged") matchesFlagFilter = !isFlagged;
+
         let rowCameraTypes = JSON.parse(row.dataset.cameraTypes || "[]");
         let rowCameraNames = JSON.parse(row.dataset.cameraNames || "[]");
         let matchesCameraType = !selectedCameraTypes.length || selectedCameraTypes.some(value => rowCameraTypes.includes(value));
         let matchesCameraName = !selectedCameraNames.length || selectedCameraNames.some(value => rowCameraNames.includes(value));
 
-        row.dataset.hidden = !(matchesTab && matchesSearch && matchesNonLiveFilter && matchesCameraType && matchesCameraName);
+        row.dataset.hidden = !(matchesTab && matchesSearch && matchesNonLiveFilter && matchesFlagFilter && matchesCameraType && matchesCameraName);
     }});
 
     showPage(currentPage);
@@ -974,6 +1024,17 @@ window.onload = function() {{
     <label style="font-weight: 500; cursor: pointer; display: flex; align-items: center; gap: 5px;">
         <input type="checkbox" id="hide-non-live" onchange="filterTable()" checked> Hide non-live marked photos
     </label>
+
+    <label style="font-weight: 500; display: flex; align-items: center; gap: 5px;">
+        Auto-flag filter:
+        <select id="flag-filter" onchange="filterTable()">
+            <option value="all">All photos</option>
+            <option value="flagged">Flagged by heuristic</option>
+            <option value="human">Human only</option>
+            <option value="landscape">Landscape only</option>
+            <option value="unflagged">Unflagged only</option>
+        </select>
+    </label>
     <button class="btn btn-success" onclick="exportNonLiveJSON()">💾 Save Non-Live List (non_live_photos.json)</button>
     <input type="file" id="import-json" accept=".json" onchange="importNonLiveJSON(event)" style="display:none;">
     <button class="btn btn-secondary" onclick="document.getElementById('import-json').click()">📁 Load non_live_photos.json</button>
@@ -1019,9 +1080,14 @@ window.onload = function() {{
             timestamp = esc(image.get("timestamp", ""))
             camera_types_json = esc(json.dumps([image["camera_type"]] if image.get("camera_type") else []))
             camera_names_json = esc(json.dumps([image["camera_name"]] if image.get("camera_name") else []))
+            human_badge = '<span class="badge-human">Includes Humans</span>' if image.get("human") else ''
+            landscape_badge = '<span class="badge-landscape">Landscape / no clear subject</span>' if image.get("landscape") else ''
 
-            f.write(f'<tr data-matched="false" data-path="{img_path}" data-dir="{dir_path}" data-filename="{orig_name}" data-timestamp="{timestamp}" data-camera-types="{camera_types_json}" data-camera-names="{camera_names_json}">')
-            f.write(f'<td><b>[UNMATCHED]</b><br>{orig_name}<span class="badge-non-live" style="display:none;">Non-Live Creature</span></td>')
+            is_human = "true" if image.get("human") else "false"
+            is_landscape = "true" if image.get("landscape") else "false"
+
+            f.write(f'<tr data-matched="false" data-path="{img_path}" data-dir="{dir_path}" data-filename="{orig_name}" data-timestamp="{timestamp}" data-camera-types="{camera_types_json}" data-camera-names="{camera_names_json}" data-human="{is_human}" data-landscape="{is_landscape}">')
+            f.write(f'<td><b>[UNMATCHED]</b><br>{orig_name}{human_badge}{landscape_badge}</td>')
             f.write(f'<td><img src="thumbnails/local/{esc(thumb_name)}"></td>')
             f.write(f'<td>{img_path}</td>')
             f.write(f'<td>{timestamp}</td>')
@@ -1057,10 +1123,21 @@ window.onload = function() {{
             first_path = local_images[0] if local_images else ""
             dir_path = esc(str(Path(first_path).parent)) if first_path else ""
 
-            f.write(f'<tr data-matched="true" data-path="{esc(first_path)}" data-dir="{dir_path}" data-filename="{inat_file}" data-timestamp="{timestamp}" data-camera-types="{camera_types_json}" data-camera-names="{camera_names_json}">')
+            human_flags = [img for img in local_image_data if img.get("human")]
+            landscape_flags = [img for img in local_image_data if img.get("landscape")]
+            flags_html = ""
+            if human_flags:
+                flags_html += '<div><span class="badge-human">Includes Humans</span></div>'
+            if landscape_flags:
+                flags_html += '<div><span class="badge-landscape">Landscape / no clear subject</span></div>'
+
+            row_human = "true" if any(img.get("human") for img in local_image_data) else "false"
+            row_landscape = "true" if any(img.get("landscape") for img in local_image_data) else "false"
+
+            f.write(f'<tr data-matched="true" data-path="{esc(first_path)}" data-dir="{dir_path}" data-filename="{inat_file}" data-timestamp="{timestamp}" data-camera-types="{camera_types_json}" data-camera-names="{camera_names_json}" data-human="{row_human}" data-landscape="{row_landscape}">')
             f.write(f'<td><b>[MATCHED]</b><br>{inat_file}</td>')
             f.write(f'<td>{thumbs_html}</td>')
-            f.write(f'<td><b>Local Files:</b><br>{local_names_html}</td>')
+            f.write(f'<td><b>Local Files:</b><br>{local_names_html}{flags_html}</td>')
             f.write(f'<td><b>Obs ID:</b> {obs_id}<br><b>Date:</b> {timestamp}</td>')
             f.write('<td><span style="color:#28a745; font-weight:bold;">Matched to iNat</span></td>')
             f.write('</tr>\n')
@@ -1574,6 +1651,56 @@ def extract_exif_camera(
         return {"camera_type": None, "camera_name": None}
 
 
+def detect_photo_flags(path):
+    """Very lightweight heuristic detector for likely human/landscape photos.
+
+    This is intentionally conservative: it flags obvious cases without trying to
+    replace a real CV model.
+    """
+    try:
+        with Image.open(path) as img:
+            rgb = img.convert("RGB")
+            w, h = rgb.size
+            if w <= 0 or h <= 0:
+                return {"human": False, "landscape": False}
+
+            # Human heuristic: look for a meaningful skin-tone cluster.
+            small = rgb.resize((max(1, w // 12), max(1, h // 12)))
+            pixels = list(small.getdata())
+            skin_pixels = 0
+            for r, g, b in pixels:
+                if (
+                    r > 95 and g > 40 and b > 20 and
+                    max(r, g, b) - min(r, g, b) > 15 and
+                    r > g and r > b
+                ):
+                    skin_pixels += 1
+            skin_ratio = skin_pixels / max(1, len(pixels))
+            likely_human = skin_ratio > 0.012
+
+            # Landscape heuristic: low edge density + wide, low-contrast scenic framing.
+            gray = rgb.convert("L")
+            gray_small = gray.resize((64, 64))
+            stats = ImageStat.Stat(gray_small)
+            contrast = stats.stddev[0]
+            edge = gray_small.filter(ImageFilter.FIND_EDGES)
+            edge_stats = ImageStat.Stat(edge)
+            edge_strength = edge_stats.mean[0]
+            aspect_ratio = max(w, h) / max(1, min(w, h))
+            likely_landscape = (
+                aspect_ratio >= 1.3 and
+                contrast < 32 and
+                edge_strength < 26 and
+                not likely_human
+            )
+
+            return {
+                "human": bool(likely_human),
+                "landscape": bool(likely_landscape)
+            }
+    except Exception:
+        return {"human": False, "landscape": False}
+
 
 def scan_local_images(
         folders,
@@ -1645,12 +1772,15 @@ def scan_local_images(
 
                 dt = extract_exif_datetime(path)
                 camera = extract_exif_camera(path)
+                flags = detect_photo_flags(path)
                 data = {
                     "path": path,
                     "filename": norm_name,
                     "original_filename": filename,
                     "timestamp": dt.isoformat() if dt else None,
-                    "timestamp_minute": timestamp_minute(dt)
+                    "timestamp_minute": timestamp_minute(dt),
+                    "human": flags.get("human", False),
+                    "landscape": flags.get("landscape", False)
                 }
                 data.update(camera)
 
