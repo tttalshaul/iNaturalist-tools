@@ -1752,7 +1752,7 @@ def scan_local_images(
                 if is_supported_image(path):
                     image_files.append(path)
 
-    for path in tqdm(image_files, desc="Checking heuristics", unit="image"):
+    for path in tqdm(image_files, desc="Scanning local images", unit="image"):
         filename = os.path.basename(path)
         abs_path = os.path.abspath(path)
         signature = get_file_signature(path)
@@ -1761,7 +1761,8 @@ def scan_local_images(
 
         if (abs_path in non_live_paths or
             path in non_live_paths or
-            sig_key in non_live_signatures):
+            sig_key in non_live_signatures or
+            norm_name in non_live_filenames):
             skipped_non_live += 1
             continue
 
@@ -1780,7 +1781,7 @@ def scan_local_images(
 
         dt = extract_exif_datetime(path)
         camera = extract_exif_camera(path)
-        flags = detect_photo_flags(path)
+        flags = {"human": False, "landscape": False}
         data = {
             "path": path,
             "filename": norm_name,
@@ -2588,6 +2589,24 @@ end tell
 # ======================================================
 
 
+def apply_heuristic_flags_to_unmatched(local_images, results):
+    matched_paths = set()
+    for result in results:
+        if result.get("status") == "MATCHED":
+            for path in result.get("local_images", []):
+                matched_paths.add(os.path.abspath(path))
+
+    for image in tqdm(local_images, desc="Checking heuristics", unit="image"):
+        abs_path = os.path.abspath(image.get("path", ""))
+        if abs_path in matched_paths:
+            continue
+        flags = detect_photo_flags(image["path"])
+        image["human"] = flags.get("human", False)
+        image["landscape"] = flags.get("landscape", False)
+
+    return local_images
+
+
 def find_local_not_in_inaturalist(
         local_images,
         results):
@@ -2915,6 +2934,8 @@ def main():
         filename_index
 
     )
+
+    local_images = apply_heuristic_flags_to_unmatched(local_images, results)
 
 
 
