@@ -23,6 +23,29 @@ except ImportError:  # pragma: no cover - optional dependency fallback
 
 from PIL import Image, ExifTags, ImageFile, ImageFilter, ImageStat
 
+try:
+    from ultralytics import YOLO
+except Exception:  # pragma: no cover - optional dependency
+    YOLO = None
+
+try:
+    import torch
+except Exception:  # pragma: no cover - optional dependency
+    torch = None
+
+try:
+    import torchvision.models as models
+    from torchvision import transforms
+except Exception:  # pragma: no cover - optional dependency
+    models = None
+    transforms = None
+
+try:
+    from transformers import AutoProcessor, AutoModel
+except Exception:  # pragma: no cover - optional dependency
+    AutoProcessor = None
+    AutoModel = None
+
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
 from openpyxl.drawing.image import Image as XLImage
@@ -1035,7 +1058,6 @@ window.onload = function() {{
         Auto-flag filter:
         <select id="flag-filter" onchange="filterTable()">
             <option value="all">All photos</option>
-            <option value="flagged">Flagged by heuristic</option>
             <option value="human">Human only</option>
             <option value="landscape">Landscape only</option>
             <option value="unflagged">Unflagged only</option>
@@ -1091,9 +1113,10 @@ window.onload = function() {{
 
             is_human = "true" if image.get("human") else "false"
             is_landscape = "true" if image.get("landscape") else "false"
+            badges_html = " ".join(part for part in [human_badge, landscape_badge] if part)
 
             f.write(f'<tr data-matched="false" data-path="{img_path}" data-dir="{dir_path}" data-filename="{orig_name}" data-timestamp="{timestamp}" data-camera-types="{camera_types_json}" data-camera-names="{camera_names_json}" data-human="{is_human}" data-landscape="{is_landscape}">')
-            f.write(f'<td><b>[UNMATCHED]</b><br>{orig_name}{human_badge}{landscape_badge}</td>')
+            f.write(f'<td><b>[UNMATCHED]</b><br>{orig_name} {badges_html}</td>')
             f.write(f'<td><img src="thumbnails/local/{esc(thumb_name)}"></td>')
             f.write(f'<td>{img_path}</td>')
             f.write(f'<td>{timestamp}</td>')
@@ -1657,55 +1680,125 @@ def extract_exif_camera(
         return {"camera_type": None, "camera_name": None}
 
 
-def detect_photo_flags(path):
-    """Very lightweight heuristic detector for likely human/landscape photos.
+_PERSON_MODEL = None
+_CLIP_MODEL = None
+_CLIP_PROCESSOR = None
 
-    This is intentionally conservative: it flags obvious cases without trying to
-    replace a real CV model.
+
+def _load_person_model():
+    global _PERSON_MODEL
+    if _PERSON_MODEL is not None:
+        return _PERSON_MODEL
+    if YOLO is None:
+        return None
+    try:
+        _PERSON_MODEL = YOLO("yolov8n.pt")
+    except Exception:
+        return None
+    return _PERSON_MODEL
+
+
+def _load_clip_model():
+    global _CLIP_MODEL, _CLIP_PROCESSOR
+    if _CLIP_MODEL is not None and _CLIP_PROCESSOR is not None:
+        return _CLIP_MODEL, _CLIP_PROCESSOR
+    if AutoProcessor is None or AutoModel is None:
+        return None, None
+    try:
+        model_name = "openai/clip-vit-large-patch14"
+        processor = AutoProcessor.from_pretrained(model_name)
+        model = AutoModel.from_pretrained(model_name)
+        model.eval()
+        _CLIP_PROCESSOR = processor
+        _CLIP_MODEL = model
+        return model, processor
+    except Exception:
+        return None, None
+
+
+def detect_photo_flags(path):
+    """Detect likely people and landscapes with local ML models when available.
+
+    Uses YOLOv8 for person detection and CLIP for landscape detection.
     """
+    likely_human = False
+    likely_landscape = False
+
     try:
         with Image.open(path) as img:
             rgb = img.convert("RGB")
             w, h = rgb.size
             if w <= 0 or h <= 0:
                 return {"human": False, "landscape": False}
-
-            # Human heuristic: look for a meaningful skin-tone cluster.
-            small = rgb.resize((max(1, w // 12), max(1, h // 12)))
-            pixels = list(small.getdata())
-            skin_pixels = 0
-            for r, g, b in pixels:
-                if (
-                    r > 95 and g > 40 and b > 20 and
-                    max(r, g, b) - min(r, g, b) > 15 and
-                    r > g and r > b
-                ):
-                    skin_pixels += 1
-            skin_ratio = skin_pixels / max(1, len(pixels))
-            likely_human = skin_ratio > 0.012
-
-            # Landscape heuristic: low edge density + wide, low-contrast scenic framing.
-            gray = rgb.convert("L")
-            gray_small = gray.resize((64, 64))
-            stats = ImageStat.Stat(gray_small)
-            contrast = stats.stddev[0]
-            edge = gray_small.filter(ImageFilter.FIND_EDGES)
-            edge_stats = ImageStat.Stat(edge)
-            edge_strength = edge_stats.mean[0]
-            aspect_ratio = max(w, h) / max(1, min(w, h))
-            likely_landscape = (
-                aspect_ratio >= 1.3 and
-                contrast < 32 and
-                edge_strength < 26 and
-                not likely_human
-            )
-
-            return {
-                "human": bool(likely_human),
-                "landscape": bool(likely_landscape)
-            }
     except Exception:
         return {"human": False, "landscape": False}
+
+    # Detect humans with YOLOv8
+    person_model = _load_person_model()
+    if person_model is not None:
+        try:
+            results = person_model(path, verbose=False, conf=0.35)
+            if results:
+                result = results[0]
+                names = getattr(result, "names", {}) or {}
+                boxes = getattr(result, "boxes", None)
+                if boxes is not None:
+                    for box in boxes:
+                        cls_index = int(box.cls.item()) if hasattr(box.cls, "item") else int(box.cls)
+                        class_name = names.get(cls_index, "").lower()
+                        confidence = float(box.conf.item()) if hasattr(box.conf, "item") else float(box.conf)
+                        if class_name == "person" and confidence >= 0.35:
+                            likely_human = True
+                            break
+        except Exception:
+            likely_human = False
+
+    # Detect landscapes with CLIP when human is not found.
+    if not likely_human:
+        clip_model, clip_processor = _load_clip_model()
+        if clip_model is not None and clip_processor is not None:
+            try:
+                image = Image.open(path).convert("RGB")
+                landscape_prompts = [
+                    "a landscape photo",
+                    "a scenic outdoor landscape",
+                    "a mountain view",
+                    "a wide open nature scene",
+                    "a forest or countryside view",
+                ]
+                negative_prompts = [
+                    "a photo of a person",
+                    "a person in a group",
+                    "an indoor room",
+                    "a food court or indoor restaurant",
+                    "a city street",
+                    "a building interior",
+                ]
+                texts = landscape_prompts + negative_prompts
+                inputs = clip_processor(
+                    text=texts,
+                    images=image,
+                    return_tensors="pt",
+                    padding=True,
+                )
+                with torch.no_grad():
+                    outputs = clip_model(**inputs)
+                    logits = outputs.logits_per_image
+                    scores = logits[0].cpu().numpy()
+
+                positive = max(float(score) for score in scores[:len(landscape_prompts)])
+                negative = max(float(score) for score in scores[len(landscape_prompts):])
+
+                # Calibrated against the labeled examples in examples_of_landscapes.txt.
+                # For the ViT-L/14 model, threshold 2.0 produced the best separation on that curated set.
+                likely_landscape = (positive - negative) > 2.0
+            except Exception:
+                likely_landscape = False
+
+    return {
+        "human": bool(likely_human),
+        "landscape": bool(likely_landscape),
+    }
 
 
 def scan_local_images(
@@ -2589,18 +2682,37 @@ end tell
 # ======================================================
 
 
+def _normalized_image_path(path):
+    if not path:
+        return ""
+    try:
+        return os.path.abspath(os.path.normpath(path))
+    except Exception:
+        return str(path)
+
+
 def apply_heuristic_flags_to_unmatched(local_images, results):
     matched_paths = set()
     for result in results:
         if result.get("status") == "MATCHED":
             for path in result.get("local_images", []):
-                matched_paths.add(os.path.abspath(path))
+                matched_paths.add(_normalized_image_path(path))
 
-    for image in tqdm(local_images, desc="Checking heuristics", unit="image"):
-        abs_path = os.path.abspath(image.get("path", ""))
-        if abs_path in matched_paths:
-            continue
-        flags = detect_photo_flags(image["path"])
+    unmatched_images = [
+        image
+        for image in local_images
+        if _normalized_image_path(image.get("path")) not in matched_paths
+    ]
+    print(
+        "Running human/landscape detection on unmatched local images:",
+        len(unmatched_images),
+        "of",
+        len(local_images),
+    )
+
+    for image in tqdm(unmatched_images, desc="Trying to identify humans and landscapes", unit="image"):
+        path = image.get("path")
+        flags = detect_photo_flags(path)
         image["human"] = flags.get("human", False)
         image["landscape"] = flags.get("landscape", False)
 
@@ -2629,7 +2741,7 @@ def find_local_not_in_inaturalist(
             for path in result["local_images"]:
 
                 matched_paths.add(
-                    path
+                    _normalized_image_path(path)
                 )
 
 
@@ -2640,9 +2752,11 @@ def find_local_not_in_inaturalist(
 
     for image in local_images:
 
+        image_path = _normalized_image_path(image.get("path"))
+
 
         if (
-            image["path"]
+            image_path
             not in
             matched_paths
         ):

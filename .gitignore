@@ -3,5 +3,6 @@
 *.csv
 *.txt
 *.html
+*.pt
 __pycache__/
 inat_comparison/
