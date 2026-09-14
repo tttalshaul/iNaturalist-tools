@@ -22,7 +22,7 @@ except ImportError:  # pragma: no cover - optional dependency fallback
     def tqdm(iterable=None, **kwargs):
         return iterable if iterable is not None else []
 
-from PIL import Image, ExifTags, ImageFile, ImageFilter, ImageStat
+from PIL import Image, ImageOps, ExifTags, ImageFile, ImageFilter, ImageStat
 
 try:
     from ultralytics import YOLO
@@ -445,7 +445,7 @@ def get_thumbnail_filename(image_path):
     safe_stem = "".join(c for c in path_obj.stem if c.isalnum() or c in ("-", "_")).rstrip()
     if not safe_stem:
         safe_stem = "thumb"
-    return f"{safe_stem}_{path_hash}.thumb.jpg"
+    return f"{safe_stem}_{path_hash}.thumb-v2.jpg"
 
 
 def create_thumbnail_file(
@@ -459,6 +459,7 @@ def create_thumbnail_file(
     try:
 
         img = Image.open(source)
+        img = ImageOps.exif_transpose(img)
         img.load()
 
         img.thumbnail(
@@ -565,6 +566,30 @@ def create_html_report(
     matched_count = len(matched_results)
     unmatched_count = len(local_missing)
     total_count = matched_count + unmatched_count
+
+    thumbnail_paths = []
+    seen_thumbnail_paths = set()
+    for image in local_missing:
+        path = image.get("path")
+        normalized_path = _normalized_image_path(path)
+        if normalized_path and normalized_path not in seen_thumbnail_paths:
+            seen_thumbnail_paths.add(normalized_path)
+            thumbnail_paths.append(path)
+    for result in matched_results:
+        for path in result.get("local_images", []):
+            normalized_path = _normalized_image_path(path)
+            if normalized_path and normalized_path not in seen_thumbnail_paths:
+                seen_thumbnail_paths.add(normalized_path)
+                thumbnail_paths.append(path)
+
+    for path in tqdm(
+            thumbnail_paths,
+            desc="Creating report thumbnails",
+            unit="thumbnail"):
+        create_thumbnail_file(
+            path,
+            local_thumb_dir / get_thumbnail_filename(path)
+        )
 
     camera_types = set()
     camera_names = set()
@@ -1157,8 +1182,6 @@ window.onload = function() {{
         # 1. Unmatched Local Photos
         for image in local_missing:
             thumb_name = get_thumbnail_filename(image["path"])
-            thumb_path = local_thumb_dir / thumb_name
-            create_thumbnail_file(image["path"], thumb_path)
 
             img_path = esc(image.get("path", ""))
             dir_path = esc(str(Path(image.get("path", "")).parent))
@@ -1185,11 +1208,6 @@ window.onload = function() {{
         # 2. Matched Observations
         for r in matched_results:
             local_images = r.get("local_images", [])
-            for local_path in local_images:
-                local_path_obj = Path(local_path)
-                local_thumb_name = get_thumbnail_filename(local_path_obj)
-                local_thumb_path = local_thumb_dir / local_thumb_name
-                create_thumbnail_file(local_path_obj, local_thumb_path)
 
             local_names = [str(Path(p)) for p in local_images]
             local_names_html = "<br>".join(esc(x) for x in local_names)
@@ -2331,6 +2349,7 @@ def create_thumbnail(
         img = Image.open(
             image_path
         )
+        img = ImageOps.exif_transpose(img)
 
 
         img.thumbnail(

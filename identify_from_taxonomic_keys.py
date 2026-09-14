@@ -12,13 +12,11 @@ import html
 import json
 import re
 import sys
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urljoin
-
-import requests
 
 try:
     from PIL import ExifTags, Image
@@ -27,7 +25,6 @@ except ImportError:  # pragma: no cover - Pillow is optional
     Image = None
 
 
-INAT_API = "https://api.inaturalist.org/v2"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"}
 STOP_WORDS = {
     "the", "and", "with", "from", "this", "that", "very", "more",
@@ -46,12 +43,36 @@ class Candidate:
 
 
 def read_text(path: Path) -> str:
+    if path.suffix.lower() == ".pdf":
+        try:
+            from pypdf import PdfReader
+        except ImportError as error:
+            raise RuntimeError(
+                "PDF input requires pypdf. Install it with: python3 -m pip install pypdf"
+            ) from error
+        reader = PdfReader(str(path))
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
     if path.suffix.lower() in {".html", ".htm"}:
-        text = re.sub(r"<script.*?</script>|<style.*?</style>", " ",
-                      path.read_text(encoding="utf-8", errors="replace"),
-                      flags=re.IGNORECASE | re.DOTALL)
-        return re.sub(r"<[^>]+>", " ", html.unescape(text))
+        return clean_html(path.read_text(encoding="utf-8", errors="replace"))
     return path.read_text(encoding="utf-8", errors="replace")
+
+
+def clean_html(text: str) -> str:
+    text = re.sub(r"<script.*?</script>|<style.*?</style>", " ", text,
+                  flags=re.IGNORECASE | re.DOTALL)
+    return re.sub(r"<[^>]+>", " ", html.unescape(text))
+
+
+def read_article(source: str) -> str:
+    parsed = urlparse(source)
+    if parsed.scheme in {"http", "https"}:
+        request = Request(source, headers={"User-Agent": "iNaturalist-taxonomic-key-reader/1.0"})
+        with urlopen(request, timeout=60) as response:
+            return clean_html(response.read().decode("utf-8", errors="replace"))
+    path = Path(source)
+    if path.suffix.lower() not in {".pdf", ".html", ".htm"}:
+        raise ValueError("Article input must be a PDF file or an HTML file/URL")
+    return read_text(path)
 
 
 def normalise(value: str) -> str:
@@ -63,37 +84,10 @@ def words(value: str) -> set[str]:
             if word not in STOP_WORDS}
 
 
-def parse_key_file(path: Path) -> list[Candidate]:
-    """Parse JSON keys or simple heading/paragraph taxonomic documents.
-
-    JSON accepts either [{"name": ..., "features": [...]}] or
-    {"taxa": [{"name": ..., "features": [...]}]}.
-    Text files use a heading such as '# Genus species' followed by evidence
-    lines. Lines beginning with Evidence:, Features:, Missing:, or Notes: are
-    especially useful but ordinary paragraphs are accepted too.
-    """
-    if path.suffix.lower() == ".json":
-        data = json.loads(path.read_text(encoding="utf-8"))
-        entries = data.get("taxa", data) if isinstance(data, dict) else data
-        candidates = []
-        for entry in entries:
-            if not isinstance(entry, dict) or not entry.get("name"):
-                continue
-            features = entry.get("features", entry.get("evidence", []))
-            if isinstance(features, str):
-                features = [features]
-            missing = entry.get("missing", [])
-            if isinstance(missing, str):
-                missing = [missing]
-            candidates.append(Candidate(str(entry["name"]),
-                                        str(entry.get("rank", "unknown")),
-                                        [str(item) for item in features],
-                                        [str(item) for item in missing]))
-        return candidates
-
+def parse_key_text(text: str) -> list[Candidate]:
     candidates: list[Candidate] = []
     current: Candidate | None = None
-    for raw_line in read_text(path).splitlines():
+    for raw_line in text.splitlines():
         line = normalise(re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", raw_line))
         if not line:
             continue
@@ -113,6 +107,10 @@ def parse_key_file(path: Path) -> list[Candidate]:
     if current:
         candidates.append(current)
     return candidates
+
+
+def parse_key_source(source: str) -> list[Candidate]:
+    return parse_key_text(read_article(source))
 
 
 def rationalise_gps(value: Any) -> float:
@@ -159,35 +157,38 @@ def image_observation(path: Path) -> dict[str, Any]:
     return result
 
 
-def observation_from_inat(observation_id: str, session: requests.Session) -> dict[str, Any]:
-    response = session.get(f"{INAT_API}/observations/{observation_id}", timeout=60)
-    response.raise_for_status()
-    observation = response.json().get("results", [{}])[0]
-    photos = []
-    for photo in observation.get("photos", []):
-        url = photo.get("url", "")
-        photos.append(urljoin(url, "") .replace("/square.", "/original.") if url else "")
-    return {
+def load_local_observation(observations_file: Path, observation_id: str,
+                           taxa_file: Path | None = None) -> dict[str, Any]:
+    observations = json.loads(observations_file.read_text(encoding="utf-8"))
+    observation = next(
+        (item for item in observations if str(item.get("id")) == str(observation_id)),
+        None,
+    )
+    if observation is None:
+        raise ValueError(f"Observation {observation_id} was not found in {observations_file}")
+
+    result: dict[str, Any] = {
         "id": observation.get("id"),
-        "observed_at": observation.get("observed_on_string") or observation.get("observed_on"),
-        "location": {"latitude": observation.get("lat"), "longitude": observation.get("lng")},
-        "taxon": observation.get("taxon", {}).get("name"),
-        "photos": [photo for photo in photos if photo],
+        "observed_at": observation.get("time_observed_at"),
+        "photos": observation.get("photos", []),
+        "taxon_id": observation.get("taxon", {}).get("id"),
     }
-
-
-def download_photos(observation: dict[str, Any], directory: Path,
-                    session: requests.Session) -> list[dict[str, Any]]:
-    directory.mkdir(parents=True, exist_ok=True)
-    photos = []
-    for index, url in enumerate(observation.get("photos", []), start=1):
-        target = directory / f"inat_{observation.get('id', 'observation')}_{index}.jpg"
-        if not target.exists():
-            response = session.get(url, timeout=120)
-            response.raise_for_status()
-            target.write_bytes(response.content)
-        photos.append(image_observation(target))
-    return photos
+    for key in ("location", "latitude", "longitude", "lat", "lng"):
+        if key in observation:
+            result[key] = observation[key]
+    if taxa_file and taxa_file.exists() and result.get("taxon_id") is not None:
+        taxa = json.loads(taxa_file.read_text(encoding="utf-8"))
+        taxon = taxa.get(str(result["taxon_id"]), {})
+        if taxon:
+            result["taxon"] = taxon.get("name")
+            result["taxon_rank"] = taxon.get("rank")
+            result["taxon_ancestors"] = taxon.get("ancestor_ids", [])
+            result["taxon_lineage"] = [
+                taxa[str(ancestor_id)]["name"]
+                for ancestor_id in taxon.get("ancestor_ids", [])
+                if str(ancestor_id) in taxa and taxa[str(ancestor_id)].get("name")
+            ] + [taxon["name"]]
+    return result
 
 
 def rank_candidates(candidates: Iterable[Candidate], observation: dict[str, Any]) -> list[Candidate]:
@@ -216,14 +217,12 @@ def rank_candidates(candidates: Iterable[Candidate], observation: dict[str, Any]
 
 def render_markdown(observation: dict[str, Any], ranked: list[Candidate]) -> str:
     lines = ["# Explainable identification", "", f"Observation: `{observation.get('id', 'local')}`", ""]
-    if observation.get("taxon_group"):
-        lines.append(f"Taxonomic group: {observation['taxon_group']}")
     if observation.get("observed_at"):
         lines.append(f"Observed at: {observation['observed_at']}")
+    if observation.get("taxon_lineage"):
+        lines.append(f"Cached taxonomy context: {' > '.join(observation['taxon_lineage'])}")
     if observation.get("location"):
         lines.append(f"Location: {observation['location']}")
-    if observation.get("features"):
-        lines.append(f"Observed characters: {', '.join(observation['features'])}")
     lines.append(f"Photos: {len(observation.get('photos', []))}")
     lines.append("")
     if not ranked:
@@ -233,7 +232,7 @@ def render_markdown(observation: dict[str, Any], ranked: list[Candidate]) -> str
     if best.score <= 0:
         lines.extend(["## No evidence-supported identification", "",
                       "The supplied observation did not match any key evidence.",
-                      "Add observed characters with `--feature`, or provide a more structured key.", ""])
+                      "The available date, location, and photo metadata did not match key evidence.", ""])
         lines.append("### Missing or useful next evidence")
         lines.extend(f"- {item}" for item in best.missing or ["observable diagnostic characters"])
         lines.append("\n### Candidates considered")
@@ -252,18 +251,15 @@ def render_markdown(observation: dict[str, Any], ranked: list[Candidate]) -> str
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--article", "--key", dest="key_files", action="append", type=Path,
-                        required=True, help="Text, Markdown, HTML, or JSON article/key (repeatable).")
+    parser.add_argument("--article", "--key", dest="article_sources", action="append",
+                        required=True, help="PDF file or HTML file/URL (repeatable).")
     parser.add_argument("--image", type=Path, action="append", help="Observation image (repeatable).")
     parser.add_argument("--image-dir", type=Path, help="Directory containing observation images.")
-    parser.add_argument("--observation-json", type=Path, help="Observation metadata JSON.")
-    parser.add_argument("--observation-id", help="Fetch an iNaturalist observation by ID.")
-    parser.add_argument("--download-dir", type=Path, default=Path("inat_identification_photos"))
-    parser.add_argument("--taxon-group", help="Restrict the report context to a group, e.g. Lepidoptera.")
-    parser.add_argument("--feature", action="append", default=[],
-                        help="Observed character from the photograph/key (repeatable).")
-    parser.add_argument("--location", help="Override location as latitude,longitude.")
-    parser.add_argument("--observed-at", help="Override observation date/time.")
+    parser.add_argument("--observations-file", type=Path, default=Path("observations.json"),
+                        help="Local iNaturalist observation cache (default: observations.json).")
+    parser.add_argument("--taxa-file", type=Path, default=Path("taxa.json"),
+                        help="Local taxon cache used to resolve the observation taxon.")
+    parser.add_argument("--observation-id", help="Select this ID from the local observations cache.")
     parser.add_argument("--output", type=Path, default=Path("identification_report.md"))
     parser.add_argument("--json-output", type=Path, help="Also write machine-readable JSON.")
     return parser.parse_args()
@@ -271,29 +267,18 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    session = requests.Session()
-    session.headers["User-Agent"] = "iNaturalist-taxonomic-key-identifier/1.0"
     observation: dict[str, Any] = {}
-    if args.observation_json:
-        observation = json.loads(args.observation_json.read_text(encoding="utf-8"))
     if args.observation_id:
-        observation.update(observation_from_inat(args.observation_id, session))
-        observation["photos"] = download_photos(observation, args.download_dir, session)
+        observation.update(load_local_observation(args.observations_file,
+                                                  args.observation_id,
+                                                  args.taxa_file))
     image_paths = list(args.image or [])
     if args.image_dir:
         image_paths.extend(path for path in args.image_dir.rglob("*")
                            if path.suffix.lower() in IMAGE_EXTENSIONS)
     observation.setdefault("photos", []).extend(image_observation(path) for path in image_paths)
-    if args.location:
-        latitude, longitude = (float(value) for value in args.location.split(",", 1))
-        observation["location"] = {"latitude": latitude, "longitude": longitude}
-    if args.observed_at:
-        observation["observed_at"] = args.observed_at
-    if args.taxon_group:
-        observation["taxon_group"] = args.taxon_group
-    if args.feature:
-        observation.setdefault("features", []).extend(args.feature)
-    candidates = [candidate for path in args.key_files for candidate in parse_key_file(path)]
+    candidates = [candidate for source in args.article_sources
+                  for candidate in parse_key_source(source)]
     ranked = rank_candidates(candidates, observation)
     args.output.write_text(render_markdown(observation, ranked), encoding="utf-8")
     if args.json_output:
