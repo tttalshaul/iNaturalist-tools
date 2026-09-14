@@ -10,6 +10,7 @@ import html
 import shutil
 from pathlib import Path
 import hashlib
+from html.parser import HTMLParser
 
 from datetime import datetime
 
@@ -71,6 +72,10 @@ CHECKPOINT_FILE = (
 
 LOCAL_CACHE_FILE = (
     "local_image_cache.json"
+)
+
+PHOTO_DETECTION_CACHE_FILE = (
+    "photo_detection_cache.json"
 )
 
 
@@ -314,6 +319,61 @@ def load_json(
     ) as f:
 
         return json.load(f)
+
+
+class _DetectionReportParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.rows = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "tr":
+            return
+        attributes = dict(attrs)
+        if "data-path" not in attributes:
+            return
+        self.rows.append({
+            "path": attributes.get("data-path", ""),
+            "matched": attributes.get("data-matched") == "true",
+            "human": attributes.get("data-human") == "true",
+            "landscape": attributes.get("data-landscape") == "true",
+        })
+
+
+def import_detection_cache_from_report(report_file, detection_cache_file):
+    parser = _DetectionReportParser()
+    with open(report_file, "r", encoding="utf-8") as f:
+        parser.feed(f.read())
+
+    detection_cache = {}
+    imported = 0
+    skipped_matched = 0
+    skipped_missing = 0
+    for row in parser.rows:
+        if row["matched"]:
+            skipped_matched += 1
+            continue
+
+        path = row["path"]
+        if not path or not os.path.isfile(path):
+            skipped_missing += 1
+            continue
+
+        detection_cache[_normalized_image_path(path)] = {
+            "signature": get_file_signature(path),
+            "flags": {
+                "human": row["human"],
+                "landscape": row["landscape"],
+            },
+        }
+        imported += 1
+
+    save_json(detection_cache_file, detection_cache)
+    print("Imported photo detection results:", imported)
+    print("Skipped matched report rows:", skipped_matched)
+    if skipped_missing:
+        print("Skipped report rows with missing files:", skipped_missing)
+    print("Saved photo detection results to", detection_cache_file)
 
 
 
@@ -925,6 +985,8 @@ function sortTable() {{
 function filterTable() {{
     let text = document.getElementById("search").value.toLowerCase();
     let hideNonLive = document.getElementById("hide-non-live").checked;
+    let hideCurrentYear = document.getElementById("hide-current-year").checked;
+    let currentYear = String(new Date().getFullYear());
     let flagFilter = document.getElementById("flag-filter").value;
     let selectedCameraTypes = Array.from(document.getElementById("camera-type-filter").selectedOptions).map(option => option.value);
     let selectedCameraNames = Array.from(document.getElementById("camera-name-filter").selectedOptions).map(option => option.value);
@@ -936,6 +998,7 @@ function filterTable() {{
         let isHuman = row.dataset.human === "true";
         let isLandscape = row.dataset.landscape === "true";
         let isFlagged = isHuman || isLandscape;
+        let isCurrentYear = (row.dataset.timestamp || "").slice(0, 4) === currentYear;
 
         let matchesTab = false;
         if (currentTab === "all") {{
@@ -948,6 +1011,7 @@ function filterTable() {{
 
         let matchesSearch = !text || row.innerText.toLowerCase().includes(text);
         let matchesNonLiveFilter = !hideNonLive || !isNonLive;
+        let matchesCurrentYearFilter = !hideCurrentYear || !isCurrentYear;
         let matchesFlagFilter = true;
         if (flagFilter === "flagged") matchesFlagFilter = isFlagged;
         else if (flagFilter === "human") matchesFlagFilter = isHuman;
@@ -959,7 +1023,7 @@ function filterTable() {{
         let matchesCameraType = !selectedCameraTypes.length || selectedCameraTypes.some(value => rowCameraTypes.includes(value));
         let matchesCameraName = !selectedCameraNames.length || selectedCameraNames.some(value => rowCameraNames.includes(value));
 
-        row.dataset.hidden = !(matchesTab && matchesSearch && matchesNonLiveFilter && matchesFlagFilter && matchesCameraType && matchesCameraName);
+        row.dataset.hidden = !(matchesTab && matchesSearch && matchesNonLiveFilter && matchesCurrentYearFilter && matchesFlagFilter && matchesCameraType && matchesCameraName);
     }});
 
     showPage(currentPage);
@@ -1052,6 +1116,10 @@ window.onload = function() {{
 
     <label style="font-weight: 500; cursor: pointer; display: flex; align-items: center; gap: 5px;">
         <input type="checkbox" id="hide-non-live" onchange="filterTable()" checked> Hide non-live marked photos
+    </label>
+
+    <label style="font-weight: 500; cursor: pointer; display: flex; align-items: center; gap: 5px;">
+        <input type="checkbox" id="hide-current-year" onchange="filterTable()"> Hide current year photos
     </label>
 
     <label style="font-weight: 500; display: flex; align-items: center; gap: 5px;">
@@ -2691,7 +2759,11 @@ def _normalized_image_path(path):
         return str(path)
 
 
-def apply_heuristic_flags_to_unmatched(local_images, results):
+def apply_heuristic_flags_to_unmatched(
+        local_images,
+        results,
+    detection_cache_file=PHOTO_DETECTION_CACHE_FILE,
+    detect_missing=True):
     matched_paths = set()
     for result in results:
         if result.get("status") == "MATCHED":
@@ -2703,18 +2775,64 @@ def apply_heuristic_flags_to_unmatched(local_images, results):
         for image in local_images
         if _normalized_image_path(image.get("path")) not in matched_paths
     ]
+
+    detection_cache = {}
+    if detection_cache_file and os.path.exists(detection_cache_file):
+        try:
+            detection_cache = load_json(detection_cache_file)
+            if not isinstance(detection_cache, dict):
+                detection_cache = {}
+            print("Loaded photo detection results from", detection_cache_file)
+        except Exception as e:
+            print(f"Warning: Failed to load {detection_cache_file}: {e}")
+
+    updated = False
+    cached_count = 0
+    detected_count = 0
+    action = "detection" if detect_missing else "cache loading"
     print(
-        "Running human/landscape detection on unmatched local images:",
-        len(unmatched_images),
-        "of",
-        len(local_images),
+        f"Running human/landscape {action} on unmatched local images: "
+        f"{len(unmatched_images)} of {len(local_images)}"
     )
 
-    for image in tqdm(unmatched_images, desc="Trying to identify humans and landscapes", unit="image"):
+    for image in tqdm(
+            unmatched_images,
+            desc=(
+                "Trying to identify humans and landscapes"
+                if detect_missing
+                else "Loading cached human/landscape results"
+            ),
+            unit="image"):
         path = image.get("path")
-        flags = detect_photo_flags(path)
+        cache_key = _normalized_image_path(path)
+        signature = get_file_signature(path)
+        cached = detection_cache.get(cache_key)
+        if cached and cached.get("signature") == signature:
+            flags = cached.get("flags", {})
+            cached_count += 1
+        elif detect_missing:
+            flags = detect_photo_flags(path)
+            detection_cache[cache_key] = {
+                "signature": signature,
+                "flags": {
+                    "human": bool(flags.get("human", False)),
+                    "landscape": bool(flags.get("landscape", False)),
+                },
+            }
+            updated = True
+            detected_count += 1
+        else:
+            flags = {"human": False, "landscape": False}
         image["human"] = flags.get("human", False)
         image["landscape"] = flags.get("landscape", False)
+
+    if updated and detection_cache_file:
+        save_json(detection_cache_file, detection_cache)
+        print("Saved photo detection results to", detection_cache_file)
+    if cached_count:
+        print("Reused cached photo detection results:", cached_count)
+    if detected_count:
+        print("New photo detections calculated:", detected_count)
 
     return local_images
 
@@ -2826,7 +2944,7 @@ def main():
 
         nargs="+",
 
-        required=True,
+        required=False,
 
         help=
         "Folders containing local photos"
@@ -2836,7 +2954,7 @@ def main():
 
     parser.add_argument(
         "--username",
-        required=True,
+        required=False,
         help="Your iNaturalist username"
     )
 
@@ -2886,6 +3004,24 @@ def main():
     )
 
     parser.add_argument(
+        "--detect-photo-flags",
+        action="store_true",
+        help="Detect humans and landscapes in unmatched photos and reuse saved results"
+    )
+
+    parser.add_argument(
+        "--detection-cache",
+        default=None,
+        help="Load saved human/landscape results from this JSON file without running detection"
+    )
+
+    parser.add_argument(
+        "--import-detection-cache-from-report",
+        metavar="REPORT_HTML",
+        help="Create the detection cache from an existing report.html and exit"
+    )
+
+    parser.add_argument(
         "--non-live-file",
         default="non_live_photos.json",
         help="JSON file containing list of non-live creature photos to skip scanning"
@@ -2913,6 +3049,17 @@ def main():
 
 
     args = parser.parse_args()
+
+    if args.import_detection_cache_from_report:
+        import_detection_cache_from_report(
+            args.import_detection_cache_from_report,
+            args.detection_cache or PHOTO_DETECTION_CACHE_FILE
+        )
+        return
+
+    if not args.folders or not args.username:
+        parser.error("--folders and --username are required unless importing a detection cache from report.html")
+
     global DEBUG_MODE
 
     if args.limit == 1:
@@ -3049,7 +3196,18 @@ def main():
 
     )
 
-    local_images = apply_heuristic_flags_to_unmatched(local_images, results)
+    if args.detect_photo_flags or args.detection_cache:
+        local_images = apply_heuristic_flags_to_unmatched(
+            local_images,
+            results,
+            detection_cache_file=args.detection_cache or PHOTO_DETECTION_CACHE_FILE,
+            detect_missing=args.detect_photo_flags
+        )
+    else:
+        print(
+            "Photo human/landscape detection disabled; use --detect-photo-flags "
+            "to calculate flags or --detection-cache FILE to load saved flags."
+        )
 
 
 

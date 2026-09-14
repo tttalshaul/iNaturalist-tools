@@ -55,6 +55,22 @@ session.headers.update({
     "User-Agent": "iNaturalist-life-first-taxa/1.0"
 })
 
+def load_api_token():
+    token_file = Path("token.txt")
+    if not token_file.exists():
+        return None
+    try:
+        with open(token_file, "r", encoding="utf-8") as f:
+            token = f.read().strip()
+        return token if token else None
+    except Exception as e:
+        print(f"Warning: could not read token.txt: {e}")
+        return None
+
+_token = load_api_token()
+if _token:
+    session.headers["Authorization"] = f"Bearer {_token}"
+
 
 def api_get(url, params=None):
     """
@@ -232,6 +248,13 @@ def update_observations(observations, user_login):
     id_above = current_max_id
     total_added = 0
 
+    if "Authorization" not in session.headers:
+        raise RuntimeError(
+            "\nCannot update observations.json without authentication.\n"
+            "token.txt is missing or empty. Please create token.txt with a valid iNaturalist API token\n"
+            "so that original_filename is retrieved and observations.json is not corrupted."
+        )
+
     while True:
 
         params = {
@@ -273,6 +296,13 @@ def update_observations(observations, user_login):
         added_this_request = 0
 
         for obs in results:
+            for photo in obs.get("photos", []):
+                if not photo.get("original_filename"):
+                    raise RuntimeError(
+                        f"\nMissing original_filename for observation {obs.get('id')}, photo {photo.get('id')}.\n"
+                        f"token.txt exists but appears to be outdated or invalid.\n"
+                        f"Please update token.txt with a valid, non-expired API token from iNaturalist."
+                    )
 
             obs_id = obs.get("id")
 
