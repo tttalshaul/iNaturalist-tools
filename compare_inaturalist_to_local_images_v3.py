@@ -792,7 +792,6 @@ let currentTab = "unmatched";
 
 let nonLivePaths = new Set();
 let nonLiveSignatures = new Set();
-let nonLiveFilenames = new Set();
 
 function initNonLiveStore() {{
     try {{
@@ -801,7 +800,6 @@ function initNonLiveStore() {{
             let data = JSON.parse(saved);
             if (data.paths) data.paths.forEach(p => nonLivePaths.add(p));
             if (data.signatures) data.signatures.forEach(s => nonLiveSignatures.add(s));
-            if (data.filenames) data.filenames.forEach(f => nonLiveFilenames.add(f));
         }}
     }} catch(e) {{
         console.error("Failed to load non-live photos from localStorage", e);
@@ -811,8 +809,7 @@ function initNonLiveStore() {{
 function saveNonLiveStore() {{
     let payload = {{
         paths: Array.from(nonLivePaths),
-        signatures: Array.from(nonLiveSignatures),
-        filenames: Array.from(nonLiveFilenames)
+        signatures: Array.from(nonLiveSignatures)
     }};
     localStorage.setItem("inat_non_live_photos", JSON.stringify(payload));
 }}
@@ -823,13 +820,11 @@ function toggleNonLive(btn, path, filename, signature) {{
     if (!filename && row && row.dataset.filename) filename = row.dataset.filename;
     if (!signature && row && row.dataset.signature) signature = row.dataset.signature;
 
-    let isNonLive = (path && nonLivePaths.has(path)) || 
-                    (filename && nonLiveFilenames.has(filename)) || 
+    let isNonLive = (path && nonLivePaths.has(path)) ||
                     (signature && nonLiveSignatures.has(signature));
 
     if (isNonLive) {{
         if (path) nonLivePaths.delete(path);
-        if (filename) nonLiveFilenames.delete(filename);
         if (signature) nonLiveSignatures.delete(signature);
         if (row) {{
             row.classList.remove("non-live-row");
@@ -842,7 +837,6 @@ function toggleNonLive(btn, path, filename, signature) {{
         }}
     }} else {{
         if (path) nonLivePaths.add(path);
-        if (filename) nonLiveFilenames.add(filename);
         if (signature) nonLiveSignatures.add(signature);
         if (row) {{
             row.classList.add("non-live-row");
@@ -861,8 +855,7 @@ function toggleNonLive(btn, path, filename, signature) {{
 function exportNonLiveJSON() {{
     let payload = {{
         paths: Array.from(nonLivePaths),
-        signatures: Array.from(nonLiveSignatures),
-        filenames: Array.from(nonLiveFilenames)
+        signatures: Array.from(nonLiveSignatures)
     }};
     let dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(payload, null, 2));
     let downloadAnchor = document.createElement('a');
@@ -885,7 +878,6 @@ function importNonLiveJSON(event) {{
             }} else if (typeof data === "object") {{
                 if (data.paths) data.paths.forEach(p => nonLivePaths.add(p));
                 if (data.signatures) data.signatures.forEach(s => nonLiveSignatures.add(s));
-                if (data.filenames) data.filenames.forEach(f => nonLiveFilenames.add(f));
             }}
             saveNonLiveStore();
             applySavedNonLiveToRows();
@@ -902,12 +894,11 @@ function applySavedNonLiveToRows() {{
     let rows = document.querySelectorAll("#results tbody tr");
     rows.forEach(function(row) {{
         let path = row.dataset.path;
-        let filename = row.dataset.filename;
         let sig = row.dataset.signature;
         let btn = row.querySelector(".btn-toggle-nonlive");
         let badge = row.querySelector(".badge-non-live");
 
-        if (btn && (nonLivePaths.has(path) || (filename && nonLiveFilenames.has(filename)) || (sig && nonLiveSignatures.has(sig)))) {{
+        if (btn && (nonLivePaths.has(path) || (sig && nonLiveSignatures.has(sig)))) {{
             row.classList.add("non-live-row");
             btn.innerText = "🌱 Mark as Live";
             btn.className = "btn btn-secondary btn-toggle-nonlive";
@@ -1883,7 +1874,6 @@ def scan_local_images(
 
     non_live_paths = set()
     non_live_signatures = set()
-    non_live_filenames = set()
 
     if non_live_file and os.path.exists(non_live_file):
         try:
@@ -1891,7 +1881,6 @@ def scan_local_images(
             if isinstance(nl_data, dict):
                 non_live_paths = {os.path.abspath(p) for p in nl_data.get("paths", [])}
                 non_live_signatures = {make_sig_key(s) for s in nl_data.get("signatures", []) if s is not None}
-                non_live_filenames = {normalize_filename(f) for f in nl_data.get("filenames", []) if f}
             elif isinstance(nl_data, list):
                 non_live_paths = {os.path.abspath(p) for p in nl_data}
             print(f"Loaded non-live creature exclusions from {non_live_file}.")
@@ -1922,8 +1911,7 @@ def scan_local_images(
 
         if (abs_path in non_live_paths or
             path in non_live_paths or
-            sig_key in non_live_signatures or
-            norm_name in non_live_filenames):
+            sig_key in non_live_signatures):
             skipped_non_live += 1
             continue
 
