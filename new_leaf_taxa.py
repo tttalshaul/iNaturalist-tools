@@ -1281,6 +1281,89 @@ Life first taxa for {html_escape(target_date)}
     ) as f:
         f.write(html)
 
+
+def make_comparison_html_report(
+    date_results,
+    filename
+):
+    """Generate a comparison report for selected dates."""
+
+    rows = []
+
+    for target_date, results in date_results:
+        observation_count = sum(
+            len(result["observations"])
+            for result in results
+        )
+
+        taxon_names = []
+
+        for result in results:
+            taxon_names.append(
+                f'<a href="{taxon_url(result["taxon_id"])}" '
+                f'target="_blank">'
+                f'{html_escape(result["name"])}'
+                f'</a>'
+            )
+
+        rows.append(
+            f"""
+            <tr>
+                <td><strong>{html_escape(target_date)}</strong></td>
+                <td>{len(results)}</td>
+                <td>{observation_count}</td>
+                <td>{"<br>".join(taxon_names)}</td>
+            </tr>
+            """
+        )
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Life first taxa comparison</title>
+<style>
+body {{
+    font-family: Arial, sans-serif;
+    margin: 30px;
+    line-height: 1.4;
+}}
+table {{
+    border-collapse: collapse;
+    width: 100%;
+}}
+th, td {{
+    border: 1px solid #ccc;
+    padding: 8px;
+    vertical-align: top;
+}}
+th {{
+    text-align: left;
+}}
+</style>
+</head>
+<body>
+<h1>Life first taxa comparison</h1>
+<table>
+<thead>
+<tr>
+    <th>Date</th>
+    <th>New leaf taxa</th>
+    <th>Observations</th>
+    <th>Taxa</th>
+</tr>
+</thead>
+<tbody>
+{"".join(rows)}
+</tbody>
+</table>
+</body>
+</html>
+"""
+
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(html)
+
 def make_top_days_html_report(
     top_days,
     observations,
@@ -1495,23 +1578,28 @@ def main():
     parser.add_argument(
         "--date",
         required=False,
-        help="Date in YYYY-MM-DD format. If omitted, generate the top-30 days report."
+        nargs="+",
+        help=(
+            "One or more dates in YYYY-MM-DD format. If omitted, "
+            "generate the top-30 days report."
+        )
     )
 
     args = parser.parse_args()
 
     # Validate date.
     if args.date:
-        try:
-            datetime.strptime(
-                args.date,
-                "%Y-%m-%d"
-            )
-        except ValueError:
-            print(
-                "ERROR: date must be YYYY-MM-DD"
-            )
-            sys.exit(1)
+        for target_date in args.date:
+            try:
+                datetime.strptime(
+                    target_date,
+                    "%Y-%m-%d"
+                )
+            except ValueError:
+                print(
+                    "ERROR: date must be YYYY-MM-DD"
+                )
+                sys.exit(1)
 
     print("=" * 70)
     print("iNaturalist new leaf taxa")
@@ -1570,43 +1658,63 @@ def main():
     if args.date:
 
         # ====================================================
-        # Specific date
+        # Specific date or selected dates
         # ====================================================
 
-        results = find_new_leaf_taxa(
-            observations,
-            taxa,
-            args.date
-        )
+        date_results = [
+            (
+                target_date,
+                find_new_leaf_taxa(
+                    observations,
+                    taxa,
+                    target_date
+                )
+            )
+            for target_date in args.date
+        ]
 
-        output_file = (
-            f"life_first_taxa_for_{args.date}.html"
-        )
-
-        make_html_report(
-            results,
-            args.date,
-            output_file
-        )
+        if len(date_results) == 1:
+            target_date, results = date_results[0]
+            output_file = (
+                f"life_first_taxa_for_{target_date}.html"
+            )
+            make_html_report(
+                results,
+                target_date,
+                output_file
+            )
+        else:
+            output_file = (
+                "life_first_taxa_for_selected_dates.html"
+            )
+            make_comparison_html_report(
+                date_results,
+                output_file
+            )
 
         print()
         print("=" * 70)
-        print(
-            f"NEW LEAF TAXA ON {args.date}: "
-            f"{len(results):,}"
-        )
+        for target_date, results in date_results:
+            print(
+                f"NEW LEAF TAXA ON {target_date}: "
+                f"{len(results):,}"
+            )
         print(
             f"HTML report: {output_file}"
         )
         print("=" * 70)
 
-        for result in results:
+        for target_date, results in date_results:
+            if len(date_results) > 1:
+                print(f"\n{target_date}")
 
-            print(
-                f"{result['name']} "
-                f"({result['rank']}, "
-                f"id={result['taxon_id']})"
-            )
+            for result in results:
+
+                print(
+                    f"{result['name']} "
+                    f"({result['rank']}, "
+                    f"id={result['taxon_id']})"
+                )
 
     else:
 
