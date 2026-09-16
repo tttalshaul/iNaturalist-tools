@@ -6,3 +6,4 @@
 *.pt
 __pycache__/
 inat_comparison/
+clip_work/
