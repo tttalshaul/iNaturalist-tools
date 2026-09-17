@@ -1343,7 +1343,19 @@ def fetch_observations(
 
                         "user.login",
 
+                        "observed_on",
+
+                        "observed_on_string",
+
                         "time_observed_at",
+
+                        "place_guess",
+
+                        "lat",
+
+                        "lng",
+
+                        "geojson",
 
                         "photos.id",
 
