@@ -10,9 +10,10 @@ claim that a photograph alone proves an identification.
 import argparse
 import html
 import json
+import os
 import re
 import sys
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlencode, urlparse
 from urllib.request import Request, urlopen
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -68,11 +69,138 @@ def read_article(source: str) -> str:
     if parsed.scheme in {"http", "https"}:
         request = Request(source, headers={"User-Agent": "iNaturalist-taxonomic-key-reader/1.0"})
         with urlopen(request, timeout=60) as response:
-            return clean_html(response.read().decode("utf-8", errors="replace"))
+            payload = response.read()
+            try:
+                text = payload.decode("utf-8", errors="replace")
+            except Exception:
+                text = str(payload)
+            if "biodiversitylibrary.org" in source.lower() or "api3" in source.lower():
+                return extract_bhl_text(text)
+            return clean_html(text)
     path = Path(source)
     if path.suffix.lower() not in {".pdf", ".html", ".htm"}:
         raise ValueError("Article input must be a PDF file or an HTML file/URL")
     return read_text(path)
+
+
+def extract_bhl_text(payload: str) -> str:
+    try:
+        data = json.loads(payload)
+    except Exception:
+        return clean_html(payload)
+
+    fragments: list[str] = []
+
+    def add(value: Any) -> None:
+        if isinstance(value, str):
+            text = normalise(value)
+            if text:
+                fragments.append(text)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                add(item)
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                lowered = str(key).lower()
+                if lowered in {"ocr", "ocrtext", "text", "title", "description", "notes", "result", "results", "items", "item"}:
+                    add(item)
+                elif isinstance(item, (dict, list, tuple)):
+                    add(item)
+
+    add(data)
+    if not fragments:
+        return clean_html(payload)
+    return "\n".join(fragments[:50])
+
+
+def load_bhl_token(paths: Iterable[Path]) -> str | None:
+    for path in paths:
+        try:
+            token = path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue
+        if token:
+            return token
+    for name in ("BHL_TOKEN", "BHL_API_KEY"):
+        token = os.environ.get(name)
+        if token and token.strip():
+            return token.strip()
+    return None
+
+
+def bhl_search_queries(observation: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    for value in [
+        observation.get("taxon"),
+        observation.get("taxon_lineage", []),
+        observation.get("taxon_ancestors", [])
+    ]:
+        if isinstance(value, str):
+            names.append(value)
+        elif isinstance(value, list):
+            names.extend(str(item) for item in value)
+    if not names:
+        names = ["bee", "wild bee"]
+    seen: set[str] = set()
+    queries: list[str] = []
+    for name in names:
+        cleaned = re.sub(r"\s+", " ", str(name)).strip()
+        if not cleaned:
+            continue
+        for query in [cleaned, f"{cleaned} bee", f"{cleaned} Hymenoptera"]:
+            query = query.strip()
+            if query and query.lower() not in seen:
+                seen.add(query.lower())
+                queries.append(query)
+    return queries[:8]
+
+
+def bhl_search_articles(query: str, token: str | None, max_results: int = 5) -> list[str]:
+    params = {
+        "op": "Search",
+        "searchterm": query,
+        "format": "json",
+        "page": "1",
+    }
+    if token:
+        params["apikey"] = token
+    url = f"https://www.biodiversitylibrary.org/api3?{urlencode(params)}"
+    try:
+        request = Request(url, headers={"User-Agent": "iNaturalist-taxonomic-key-reader/1.0"})
+        with urlopen(request, timeout=60) as response:
+            payload = response.read().decode("utf-8", errors="replace")
+    except Exception:
+        return []
+
+    try:
+        data = json.loads(payload)
+    except Exception:
+        return []
+
+    items: list[str] = []
+    for key in ("Result", "result", "results", "Items", "items"):
+        values = data.get(key) if isinstance(data, dict) else None
+        if values is None:
+            continue
+        if isinstance(values, list):
+            raw_items = values
+        elif isinstance(values, dict):
+            raw_items = list(values.values())
+        else:
+            raw_items = [values]
+        for item in raw_items[:max_results]:
+            if not isinstance(item, dict):
+                continue
+            page_id = item.get("PageID") or item.get("pageid") or item.get("page_id")
+            item_id = item.get("ItemID") or item.get("itemid") or item.get("item_id")
+            title = item.get("Title") or item.get("title") or item.get("Name") or item.get("name")
+            if page_id:
+                items.append(f"https://www.biodiversitylibrary.org/api3?op=GetPageMetadata&pageid={page_id}&format=json&ocr=t")
+            elif item_id:
+                items.append(f"https://www.biodiversitylibrary.org/api3?op=GetItemMetadata&id={item_id}&format=json")
+            elif title:
+                items.append(f"https://www.biodiversitylibrary.org/api3?op=Search&searchterm={quote_plus(str(title))}&format=json")
+    return items[:max_results]
 
 
 def normalise(value: str) -> str:
@@ -251,8 +379,10 @@ def render_markdown(observation: dict[str, Any], ranked: list[Candidate]) -> str
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source", choices=["bhl", "local"], default="bhl",
+                        help="Default is BHL; use 'local' to search supplied PDF/HTML article files instead.")
     parser.add_argument("--article", "--key", dest="article_sources", action="append",
-                        required=True, help="PDF file or HTML file/URL (repeatable).")
+                        help="Local PDF or HTML file/URL (repeatable). Only used when --source local.")
     parser.add_argument("--image", type=Path, action="append", help="Observation image (repeatable).")
     parser.add_argument("--image-dir", type=Path, help="Directory containing observation images.")
     parser.add_argument("--observations-file", type=Path, default=Path("observations.json"),
@@ -260,6 +390,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--taxa-file", type=Path, default=Path("taxa.json"),
                         help="Local taxon cache used to resolve the observation taxon.")
     parser.add_argument("--observation-id", help="Select this ID from the local observations cache.")
+    parser.add_argument("--bhl-token", type=Path, help="Path to a BHL API token file (default: bhl_token.txt).")
     parser.add_argument("--output", type=Path, default=Path("identification_report.md"))
     parser.add_argument("--json-output", type=Path, help="Also write machine-readable JSON.")
     return parser.parse_args()
@@ -277,8 +408,25 @@ def main() -> int:
         image_paths.extend(path for path in args.image_dir.rglob("*")
                            if path.suffix.lower() in IMAGE_EXTENSIONS)
     observation.setdefault("photos", []).extend(image_observation(path) for path in image_paths)
-    candidates = [candidate for source in args.article_sources
-                  for candidate in parse_key_source(source)]
+
+    if args.source == "bhl":
+        token = load_bhl_token([args.bhl_token] if args.bhl_token else [Path("bhl_token.txt")])
+        queries = bhl_search_queries(observation)
+        bhl_sources: list[str] = []
+        for query in queries:
+            bhl_sources.extend(bhl_search_articles(query, token, max_results=3))
+        if not bhl_sources:
+            article_sources = list(args.article_sources or [])
+            if not article_sources:
+                raise ValueError("BHL search returned no results. Provide --source local with --article or add a BHL token.")
+        else:
+            article_sources = bhl_sources
+    else:
+        article_sources = list(args.article_sources or [])
+        if not article_sources:
+            raise ValueError("--source local requires at least one --article value.")
+
+    candidates = [candidate for source in article_sources for candidate in parse_key_source(source)]
     ranked = rank_candidates(candidates, observation)
     args.output.write_text(render_markdown(observation, ranked), encoding="utf-8")
     if args.json_output:

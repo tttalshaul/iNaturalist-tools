@@ -63,7 +63,7 @@ INAT_API_URL = (
 )
 
 TOKEN_FILE = (
-    "token.txt"
+    "inaturalist_token.txt"
 )
 
 CHECKPOINT_FILE = (
@@ -116,8 +116,8 @@ def load_api_token():
     ):
 
         raise RuntimeError(
-            "Missing token.txt\n"
-            "Create token.txt and paste "
+            "Missing inaturalist_token.txt\n"
+            "Create inaturalist_token.txt and paste "
             "your iNaturalist API token."
         )
 
@@ -134,7 +134,7 @@ def load_api_token():
     if not token:
 
         raise RuntimeError(
-            "token.txt is empty"
+            "inaturalist_token.txt is empty"
         )
 
 
