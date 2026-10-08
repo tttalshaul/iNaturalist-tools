@@ -116,8 +116,8 @@ def load_api_token():
     ):
 
         raise RuntimeError(
-            "Missing inaturalist_token.txt\n"
-            "Create inaturalist_token.txt and paste "
+            f"Missing {TOKEN_FILE}\n"
+            f"Create {TOKEN_FILE} and paste "
             "your iNaturalist API token."
         )
 
@@ -128,15 +128,27 @@ def load_api_token():
         encoding="utf-8"
     ) as f:
 
-        token = f.read().strip()
+        raw = f.read().strip()
 
 
-    if not token:
+    if not raw:
 
         raise RuntimeError(
-            "inaturalist_token.txt is empty"
+            f"{TOKEN_FILE} is empty"
         )
 
+    # Handle multiple JWTs pasted into the file:
+    # split on the JWT header and take the last complete token.
+    jwt_header = "eyJhbGciOiJIUzUxMiJ9"
+    parts = raw.split(jwt_header)
+    if len(parts) > 2:
+        token = jwt_header + parts[-1]
+        # Auto-fix the file to contain only the valid token
+        with open(TOKEN_FILE, "w", encoding="utf-8") as f:
+            f.write(token + "\n")
+        print(f"Note: {TOKEN_FILE} contained multiple tokens; kept the latest one.")
+    else:
+        token = raw
 
     return token
 
@@ -413,22 +425,52 @@ def timestamp_minute(
 
 import re
 
-def parse_date_from_path(path):
+def parse_datetime_from_path(path):
     if not path:
         return None
-    m = re.search(r"(\d{4})[-_.](\d{1,2})[-_.](\d{1,2})", path)
+    # 1. WhatsApp format: WhatsApp Image 2021-09-26 at 23.43.20
+    m = re.search(r"(\d{4})[-_.](\d{1,2})[-_.](\d{1,2})\s+at\s+(\d{1,2})[.](\d{1,2})[.](\d{1,2})", path, re.IGNORECASE)
     if m:
         try:
-            return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
-        except Exception:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5)), int(m.group(6)))
+        except ValueError:
             pass
+
+    # 2. Standard timestamp: 2021-09-26_23-43-20 or 20210926_234320
+    m = re.search(r"(\d{4})[-_.]?(\d{2})[-_.]?(\d{2})[-_T ](\d{2})[-_.:](\d{2})[-_.:](\d{2})", path)
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5)), int(m.group(6)))
+        except ValueError:
+            pass
+
+    # 3. YYYY-MM-DD or YYYY.MM.DD or YYYY_MM_DD
+    m = re.search(r"(?:^|[^\d])(\d{4})[-_.](\d{1,2})[-_.](\d{1,2})(?:$|[^\d])", path)
+    if m:
+        try:
+            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            if 1970 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31:
+                return datetime(y, mo, d)
+        except ValueError:
+            pass
+
+    # 4. DD.MM.YY or DD.MM.YYYY
     m = re.search(r"(?:^|[^\d])(\d{1,2})[.](\d{1,2})[.](\d{2,4})(?:$|[^\d])", path)
     if m:
-        d, m_num, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        if y < 100:
-            y += 2000
-        if 1 <= m_num <= 12 and 1 <= d <= 31:
-            return f"{y:04d}-{m_num:02d}-{d:02d}"
+        try:
+            d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            if y < 100:
+                y += 2000
+            if 1970 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31:
+                return datetime(y, mo, d)
+        except ValueError:
+            pass
+    return None
+
+def parse_date_from_path(path):
+    dt = parse_datetime_from_path(path)
+    if dt:
+        return dt.strftime("%Y-%m-%d")
     return None
 
 def get_candidate_date(candidate):
@@ -514,19 +556,52 @@ def esc(value):
     )
 
 
+def parse_date_to_timestamp(val):
+    if not val:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, datetime):
+        return val.timestamp()
+    if isinstance(val, str):
+        val = val.strip()
+        if not val:
+            return None
+        for fmt in (
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%d",
+            "%Y:%m:%d %H:%M:%S",
+            "%d.%m.%Y",
+            "%d.%m.%y",
+        ):
+            try:
+                return datetime.strptime(val[:19], fmt).timestamp()
+            except ValueError:
+                continue
+        try:
+            return datetime.fromisoformat(val).timestamp()
+        except Exception:
+            pass
+    return None
+
+
 def sort_items(items, sort_by="date", sort_order="asc", group_by_dir=True, item_type="unmatched"):
+    reverse = (sort_order == "desc")
+
     def sort_key(item):
         if item_type == "unmatched":
             path = item.get("path", "")
             dir_path = str(Path(path).parent).lower() if path else ""
             fname = (item.get("original_filename") or item.get("filename") or "").lower()
-            ts = item.get("timestamp") or ""
+            raw_ts = item.get("timestamp") or item.get("timestamp_minute") or ""
         else:
             local_imgs = item.get("local_images", [])
             path = local_imgs[0] if local_imgs else ""
             dir_path = str(Path(path).parent).lower() if path else ""
             fname = (item.get("inat_original_filename") or "").lower()
-            ts = item.get("timestamp") or ""
+            raw_ts = item.get("timestamp") or item.get("inat_timestamp") or ""
 
         dir_k = dir_path if group_by_dir else ""
         if sort_by == "filename":
@@ -534,11 +609,14 @@ def sort_items(items, sort_by="date", sort_order="asc", group_by_dir=True, item_
         elif sort_by == "dir":
             val_k = dir_path
         else:
-            val_k = ts if ts else ("0000-00-00" if sort_order == "desc" else "9999-99-99")
+            epoch = parse_date_to_timestamp(raw_ts)
+            if epoch is None:
+                val_k = -float("inf") if reverse else float("inf")
+            else:
+                val_k = epoch
 
         return (dir_k, val_k, fname)
 
-    reverse = (sort_order == "desc")
     return sorted(items, key=sort_key, reverse=reverse)
 
 
@@ -945,6 +1023,28 @@ function onSortChange() {{
     filterTable();
 }}
 
+function parseDateToEpoch(str) {{
+    if (!str) return null;
+    str = String(str).trim();
+    if (!str) return null;
+    let norm = str.replace(" ", "T");
+    let t = Date.parse(norm);
+    if (!isNaN(t)) return t;
+    let m = str.match(/^(\d{{1,2}})[.](\d{{1,2}})[.](\d{{2,4}})(?:\s+(\d{{1,2}}):(\d{{1,2}})(?::(\d{{1,2}}))?)?$/);
+    if (m) {{
+        let y = parseInt(m[3], 10);
+        if (y < 100) y += 2000;
+        let mo = parseInt(m[2], 10) - 1;
+        let d = parseInt(m[1], 10);
+        let hh = m[4] ? parseInt(m[4], 10) : 0;
+        let mm = m[5] ? parseInt(m[5], 10) : 0;
+        let ss = m[6] ? parseInt(m[6], 10) : 0;
+        let dt = new Date(y, mo, d, hh, mm, ss);
+        if (!isNaN(dt.getTime())) return dt.getTime();
+    }}
+    return null;
+}}
+
 function sortTable() {{
     let tbody = document.querySelector("#results tbody");
     if (!tbody) return;
@@ -966,17 +1066,19 @@ function sortTable() {{
 
         if (groupByDir) {{
             let dirCmp = dirA.localeCompare(dirB);
-            if (dirCmp !== 0) return dirCmp;
+            if (dirCmp !== 0) return (sortOrder === "desc" ? -dirCmp : dirCmp);
         }}
 
         let cmp = 0;
         if (sortBy === "filename") {{
             cmp = fileA.localeCompare(fileB);
         }} else if (sortBy === "date") {{
-            if (!dateA && !dateB) cmp = 0;
-            else if (!dateA) return 1;
-            else if (!dateB) return -1;
-            else cmp = dateA.localeCompare(dateB);
+            let timeA = parseDateToEpoch(dateA);
+            let timeB = parseDateToEpoch(dateB);
+            if (timeA === null && timeB === null) cmp = 0;
+            else if (timeA === null) return 1;
+            else if (timeB === null) return -1;
+            else cmp = (timeA < timeB ? -1 : (timeA > timeB ? 1 : 0));
         }} else if (sortBy === "dir") {{
             cmp = dirA.localeCompare(dirB);
         }}
@@ -1187,7 +1289,9 @@ window.onload = function() {{
             dir_path = esc(str(Path(image.get("path", "")).parent))
             orig_name = esc(image.get("original_filename", ""))
             norm_filename = esc(image.get("filename", ""))
-            timestamp = esc(image.get("timestamp", ""))
+            raw_ts = image.get("timestamp") or image.get("timestamp_minute") or ""
+            timestamp = esc(raw_ts)
+            display_ts = esc(raw_ts.replace("T", " "))
             camera_types_json = esc(json.dumps([image["camera_type"]] if image.get("camera_type") else []))
             camera_names_json = esc(json.dumps([image["camera_name"]] if image.get("camera_name") else []))
             human_badge = '<span class="badge-human">Includes Humans</span>' if image.get("human") else ''
@@ -1201,7 +1305,7 @@ window.onload = function() {{
             f.write(f'<td><b>[UNMATCHED]</b><br>{orig_name} {badges_html}</td>')
             f.write(f'<td><img src="thumbnails/local/{esc(thumb_name)}"></td>')
             f.write(f'<td>{img_path}</td>')
-            f.write(f'<td>{timestamp}</td>')
+            f.write(f'<td>{display_ts}</td>')
             f.write('<td><button class="btn btn-warning btn-toggle-nonlive" onclick="toggleNonLive(this)">🚫 Mark Not Live</button></td>')
             f.write('</tr>\n')
 
@@ -1224,7 +1328,9 @@ window.onload = function() {{
 
             inat_file = esc(r.get("inat_original_filename", ""))
             obs_id = esc(r.get("observation_id", ""))
-            timestamp = esc(r.get("timestamp", ""))
+            raw_ts = r.get("timestamp") or r.get("inat_timestamp") or ""
+            timestamp = esc(raw_ts)
+            display_ts = esc(raw_ts.replace("T", " "))
 
             first_path = local_images[0] if local_images else ""
             dir_path = esc(str(Path(first_path).parent)) if first_path else ""
@@ -1244,7 +1350,7 @@ window.onload = function() {{
             f.write(f'<td><b>[MATCHED]</b><br>{inat_file}</td>')
             f.write(f'<td>{thumbs_html}</td>')
             f.write(f'<td><b>Local Files:</b><br>{local_names_html}{flags_html}</td>')
-            f.write(f'<td><b>Obs ID:</b> {obs_id}<br><b>Date:</b> {timestamp}</td>')
+            f.write(f'<td><b>Obs ID:</b> {obs_id}<br><b>Date:</b> {display_ts}</td>')
             f.write('<td><span style="color:#28a745; font-weight:bold;">Matched to iNat</span></td>')
             f.write('</tr>\n')
 
@@ -1469,8 +1575,10 @@ def fetch_observations(
                         f"Observation ID: {obs.get('id')}\n"
                         f"Photo ID: {photo.get('id')}\n\n"
                         "Cannot continue safely.\n"
-                        "The script does not guess filenames "
-                        "from URLs."
+                        "This usually means the API token "
+                        f"in {TOKEN_FILE} is expired or invalid.\n"
+                        f"Please update {TOKEN_FILE} with a fresh "
+                        "iNaturalist API token and try again."
                     )
 
 
@@ -1692,60 +1800,50 @@ def get_file_signature(
 
 
 
-def extract_exif_datetime(
-        path):
-
-
+def extract_exif_datetime(path):
     try:
-
-        img = Image.open(
-            path
-        )
-
-
+        img = Image.open(path)
         exif = img.getexif()
+        candidates = []
+        if exif:
+            for key, value in exif.items():
+                candidates.append((ExifTags.TAGS.get(key), value))
 
+            try:
+                exif_ifd = exif.get_ifd(ExifTags.IFD.Exif)
+                if exif_ifd:
+                    for key, value in exif_ifd.items():
+                        candidates.append((ExifTags.TAGS.get(key), value))
+            except Exception:
+                pass
 
-        if not exif:
+        if not candidates and hasattr(img, "_getexif"):
+            try:
+                raw_exif = img._getexif() or {}
+                for key, value in raw_exif.items():
+                    candidates.append((ExifTags.TAGS.get(key), value))
+            except Exception:
+                pass
 
-            return None
-
-
-
-        for key, value in exif.items():
-
-
-            tag = ExifTags.TAGS.get(
-                key
-            )
-
-
-            if tag in (
-
-                "DateTimeOriginal",
-
-                "DateTime"
-
-            ):
-
-
-                return datetime.strptime(
-
-                    value,
-
-                    "%Y:%m:%d %H:%M:%S"
-
-                )
-
-
-
+        for tag, value in candidates:
+            if tag in ("DateTimeOriginal", "DateTimeDigitized", "DateTime") and isinstance(value, str):
+                cleaned = value.strip().rstrip("\x00")
+                for fmt in (
+                    "%Y:%m:%d %H:%M:%S",
+                    "%Y-%m-%d %H:%M:%S",
+                    "%Y:%m:%d %H:%M",
+                    "%Y-%m-%d %H:%M",
+                    "%Y-%m-%dT%H:%M:%S",
+                ):
+                    try:
+                        return datetime.strptime(cleaned, fmt)
+                    except ValueError:
+                        continue
     except Exception:
-
         pass
 
-
-
-    return None
+    # Fallback to datetime parsed from file path or folder name
+    return parse_datetime_from_path(path)
 
 
 def extract_exif_camera(
@@ -1955,6 +2053,12 @@ def scan_local_images(
                 if data.get("filename") != norm_name:
                     data["filename"] = norm_name
                     updated = True
+                if not data.get("timestamp"):
+                    dt = extract_exif_datetime(path)
+                    if dt:
+                        data["timestamp"] = dt.isoformat()
+                        data["timestamp_minute"] = timestamp_minute(dt)
+                        updated = True
                 images.append(data)
                 continue
 
@@ -2296,6 +2400,14 @@ def compare_photos(
 
 
 
+        obs_dt = photo.get("timestamp")
+        matched_ts = obs_dt.isoformat() if obs_dt else None
+        if not matched_ts and local_image_data:
+            for l_img in local_image_data:
+                if l_img.get("timestamp"):
+                    matched_ts = l_img["timestamp"]
+                    break
+
         results.append(
             {
 
@@ -2314,10 +2426,13 @@ def compare_photos(
                 "inat_original_filename":
                     photo["inat_original_filename"],
 
+                "timestamp":
+                    matched_ts,
+
                 "inat_timestamp":
                     timestamp_minute(
                         photo["timestamp"]
-                    ),
+                    ) or (matched_ts[:16].replace("T", " ") if matched_ts else None),
 
 
                 "inat_photo_url":

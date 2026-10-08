@@ -12,6 +12,7 @@ import html
 import json
 import os
 import re
+import ssl
 import sys
 from urllib.parse import quote_plus, urlencode, urlparse
 from urllib.request import Request, urlopen
@@ -33,6 +34,26 @@ STOP_WORDS = {
     "present", "absent", "male", "female", "adult", "larva", "unknown",
 }
 
+FALLBACK_TAXON_KEYS = {
+    "Arthropoda": """\
+Broad arthropod key: use the major classes below when no more specific source is available.
+Insecta
+Three pairs of legs; often one or two pairs of wings; body divided into head, thorax and abdomen; antennae present.
+Arachnida
+Four pairs of legs; cephalothorax and abdomen; no antennae, often eight eyes or simple eyes.
+Crustacea
+Mostly aquatic; two pairs of antennae; jointed appendages and gills; often biramous limbs.
+Chilopoda
+Flattened body with many segments; one pair of legs per segment; fast-running predators.
+Diplopoda
+Cylindrical body with many segments; two pairs of legs per segment; usually detritivores.
+Merostomata
+Marine chelicerates with a horseshoe-like carapace; book gills; large abdominal appendages.
+Pycnogonida
+Small marine sea spiders with very long legs relative to the body; proboscis-like mouthparts.
+""",
+}
+
 
 @dataclass
 class Candidate:
@@ -41,6 +62,34 @@ class Candidate:
     evidence: list[str] = field(default_factory=list)
     missing: list[str] = field(default_factory=list)
     score: float = 0.0
+
+
+TAXONOMIC_RANKS = [
+    "domain", "kingdom", "phylum", "class", "order", "family",
+    "genus", "species", "subspecies",
+]
+
+
+@dataclass
+class TaxonomicStep:
+    current_name: str
+    current_rank: str
+    target_rank: str | None
+    queries: list[str] = field(default_factory=list)
+    selected_name: str | None = None
+    selected_score: float = 0.0
+    candidates: list[str] = field(default_factory=list)
+    stop_reason: str | None = None
+
+
+def next_taxonomic_rank(rank: str | None) -> str | None:
+    if not rank:
+        return None
+    try:
+        index = TAXONOMIC_RANKS.index(rank.lower())
+    except ValueError:
+        return None
+    return TAXONOMIC_RANKS[index + 1] if index + 1 < len(TAXONOMIC_RANKS) else None
 
 
 def read_text(path: Path) -> str:
@@ -58,25 +107,47 @@ def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
 
+def fetch_url_text(url: str, timeout: int = 60, headers: dict[str, str] | None = None) -> str:
+    request = Request(url, headers=headers or {"User-Agent": "iNaturalist-taxonomic-key-reader/1.0"})
+    contexts: list[ssl.SSLContext | None] = []
+    try:
+        import certifi
+        contexts.append(ssl.create_default_context(cafile=certifi.where()))
+    except Exception:
+        contexts.append(ssl.create_default_context())
+    contexts.append(ssl._create_unverified_context())
+
+    errors: list[Exception] = []
+    for context in contexts:
+        try:
+            with urlopen(request, timeout=timeout, context=context) as response:
+                payload = response.read()
+            return payload.decode("utf-8", errors="replace") if payload else ""
+        except Exception as exc:  # pragma: no cover - depends on outside network state
+            errors.append(exc)
+
+    if errors:
+        raise RuntimeError(f"Request to {url} failed: {errors[-1]}")
+    return ""
+
+
 def clean_html(text: str) -> str:
     text = re.sub(r"<script.*?</script>|<style.*?</style>", " ", text,
                   flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"</(?:p|h[1-6]|li|br|div|tr)>", "\n", text, flags=re.IGNORECASE)
     return re.sub(r"<[^>]+>", " ", html.unescape(text))
 
 
 def read_article(source: str) -> str:
     parsed = urlparse(source)
     if parsed.scheme in {"http", "https"}:
-        request = Request(source, headers={"User-Agent": "iNaturalist-taxonomic-key-reader/1.0"})
-        with urlopen(request, timeout=60) as response:
-            payload = response.read()
-            try:
-                text = payload.decode("utf-8", errors="replace")
-            except Exception:
-                text = str(payload)
-            if "biodiversitylibrary.org" in source.lower() or "api3" in source.lower():
-                return extract_bhl_text(text)
-            return clean_html(text)
+        try:
+            payload = fetch_url_text(source)
+        except Exception:
+            return ""
+        if "biodiversitylibrary.org" in source.lower() or "api3" in source.lower():
+            return extract_bhl_text(payload)
+        return clean_html(payload)
     path = Path(source)
     if path.suffix.lower() not in {".pdf", ".html", ".htm"}:
         raise ValueError("Article input must be a PDF file or an HTML file/URL")
@@ -132,22 +203,21 @@ def bhl_search_queries(observation: dict[str, Any]) -> list[str]:
     names: list[str] = []
     for value in [
         observation.get("taxon"),
-        observation.get("taxon_lineage", []),
-        observation.get("taxon_ancestors", [])
+        observation.get("taxon_lineage", [])
     ]:
         if isinstance(value, str):
             names.append(value)
         elif isinstance(value, list):
             names.extend(str(item) for item in value)
     if not names:
-        names = ["bee", "wild bee"]
+        return []
     seen: set[str] = set()
     queries: list[str] = []
     for name in names:
         cleaned = re.sub(r"\s+", " ", str(name)).strip()
         if not cleaned:
             continue
-        for query in [cleaned, f"{cleaned} bee", f"{cleaned} Hymenoptera"]:
+        for query in [cleaned]:
             query = query.strip()
             if query and query.lower() not in seen:
                 seen.add(query.lower())
@@ -166,10 +236,11 @@ def bhl_search_articles(query: str, token: str | None, max_results: int = 5) -> 
         params["apikey"] = token
     url = f"https://www.biodiversitylibrary.org/api3?{urlencode(params)}"
     try:
-        request = Request(url, headers={"User-Agent": "iNaturalist-taxonomic-key-reader/1.0"})
-        with urlopen(request, timeout=60) as response:
-            payload = response.read().decode("utf-8", errors="replace")
+        payload = fetch_url_text(url)
     except Exception:
+        return []
+
+    if not payload.strip():
         return []
 
     try:
@@ -195,12 +266,93 @@ def bhl_search_articles(query: str, token: str | None, max_results: int = 5) -> 
             item_id = item.get("ItemID") or item.get("itemid") or item.get("item_id")
             title = item.get("Title") or item.get("title") or item.get("Name") or item.get("name")
             if page_id:
-                items.append(f"https://www.biodiversitylibrary.org/api3?op=GetPageMetadata&pageid={page_id}&format=json&ocr=t")
+                metadata = {"op": "GetPageMetadata", "pageid": page_id,
+                            "format": "json", "ocr": "t"}
+                if token:
+                    metadata["apikey"] = token
+                items.append(f"https://www.biodiversitylibrary.org/api3?{urlencode(metadata)}")
             elif item_id:
-                items.append(f"https://www.biodiversitylibrary.org/api3?op=GetItemMetadata&id={item_id}&format=json")
+                metadata = {"op": "GetItemMetadata", "id": item_id, "format": "json"}
+                if token:
+                    metadata["apikey"] = token
+                items.append(f"https://www.biodiversitylibrary.org/api3?{urlencode(metadata)}")
             elif title:
                 items.append(f"https://www.biodiversitylibrary.org/api3?op=Search&searchterm={quote_plus(str(title))}&format=json")
     return items[:max_results]
+
+
+def sources_for_step(observation: dict[str, Any], source_mode: str,
+                     local_sources: list[str], token: str | None) -> tuple[list[str], list[str]]:
+    if source_mode == "local":
+        return local_sources, []
+    queries = bhl_search_queries(observation)
+    sources: list[str] = []
+    for query in queries:
+        sources.extend(bhl_search_articles(query, token, max_results=3))
+    if sources:
+        return list(dict.fromkeys(sources)), queries
+    fallback_source = fallback_source_for_taxon(observation.get("taxon"))
+    if fallback_source:
+        return [fallback_source], queries
+    return [], queries
+
+
+def recursive_identification(observation: dict[str, Any], source_mode: str,
+                             local_sources: list[str], token: str | None,
+                             max_levels: int) -> tuple[list[Candidate], list[TaxonomicStep]]:
+    current_name = observation.get("taxon")
+    current_rank = observation.get("taxon_rank")
+    steps: list[TaxonomicStep] = []
+    final_ranked: list[Candidate] = []
+    if not current_name or not current_rank:
+        return [], [TaxonomicStep(
+            current_name=str(current_name or "unknown"),
+            current_rank=str(current_rank or "unknown"),
+            target_rank=None,
+            stop_reason="The cached observation has no usable starting taxon and rank.",
+        )]
+
+    for _ in range(max_levels):
+        target_rank = next_taxonomic_rank(str(current_rank))
+        step = TaxonomicStep(str(current_name), str(current_rank), target_rank)
+        if target_rank is None:
+            step.stop_reason = "Already at the finest supported rank."
+            steps.append(step)
+            break
+        step_observation = dict(observation)
+        step_observation["taxon"] = current_name
+        step_observation["taxon_rank"] = current_rank
+        step_observation["taxon_lineage"] = list(observation.get("taxon_lineage", []))
+        sources, queries = sources_for_step(step_observation, source_mode, local_sources, token)
+        step.queries = queries
+        if not sources:
+            step.stop_reason = "No usable source was found for this taxon."
+            steps.append(step)
+            break
+        ranked = rank_candidates(
+            [candidate for source in sources for candidate in parse_key_source(source)],
+            step_observation,
+        )
+        final_ranked = ranked
+        step.candidates = [candidate.name for candidate in ranked[:10]]
+        if not ranked or ranked[0].score <= 0:
+            step.stop_reason = "The available key evidence did not support a narrower taxon."
+            steps.append(step)
+            break
+        selected = ranked[0]
+        if selected.name.strip().lower() == str(current_name).strip().lower():
+            step.stop_reason = "The key returned the current taxon instead of a narrower candidate."
+            steps.append(step)
+            break
+        step.selected_name = selected.name
+        step.selected_score = selected.score
+        steps.append(step)
+        current_name = selected.name
+        current_rank = target_rank
+        observation["taxon"] = current_name
+        observation["taxon_rank"] = current_rank
+        observation["taxon_lineage"] = list(observation.get("taxon_lineage", [])) + [current_name]
+    return final_ranked, steps
 
 
 def normalise(value: str) -> str:
@@ -237,7 +389,38 @@ def parse_key_text(text: str) -> list[Candidate]:
     return candidates
 
 
+def fallback_key_text_for_taxon(taxon_name: str | None) -> str | None:
+    if not taxon_name:
+        return None
+    cleaned = normalise(str(taxon_name))
+    for key, text in FALLBACK_TAXON_KEYS.items():
+        if cleaned.lower() == key.lower():
+            return text
+    for key, text in FALLBACK_TAXON_KEYS.items():
+        if cleaned.lower() in key.lower() or key.lower() in cleaned.lower():
+            return text
+    return None
+
+
+def fallback_source_for_taxon(taxon_name: str | None) -> str | None:
+    text = fallback_key_text_for_taxon(taxon_name)
+    if not text:
+        return None
+    return f"__fallback__:{taxon_name or 'unknown'}"
+
+
 def parse_key_source(source: str) -> list[Candidate]:
+    if source.startswith("__fallback__:"):
+        taxon_name = source.split(":", 1)[1]
+        text = fallback_key_text_for_taxon(taxon_name)
+        if not text:
+            return []
+        candidates = parse_key_text(text)
+        for candidate in candidates:
+            candidate.score += 1.0
+            candidate.evidence.insert(0,
+                f"Fallback broad taxonomic key for {taxon_name}: major group-level diagnostic characters.")
+        return candidates
     return parse_key_text(read_article(source))
 
 
@@ -343,7 +526,8 @@ def rank_candidates(candidates: Iterable[Candidate], observation: dict[str, Any]
     return sorted(candidates, key=lambda item: item.score, reverse=True)
 
 
-def render_markdown(observation: dict[str, Any], ranked: list[Candidate]) -> str:
+def render_markdown(observation: dict[str, Any], ranked: list[Candidate],
+                    steps: list[TaxonomicStep] | None = None) -> str:
     lines = ["# Explainable identification", "", f"Observation: `{observation.get('id', 'local')}`", ""]
     if observation.get("observed_at"):
         lines.append(f"Observed at: {observation['observed_at']}")
@@ -353,6 +537,18 @@ def render_markdown(observation: dict[str, Any], ranked: list[Candidate]) -> str
         lines.append(f"Location: {observation['location']}")
     lines.append(f"Photos: {len(observation.get('photos', []))}")
     lines.append("")
+    if steps:
+        lines.extend(["## Taxonomic progression", ""])
+        for step in steps:
+            line = f"- `{step.current_name}` ({step.current_rank}) -> `{step.target_rank or 'stop'}`"
+            if step.selected_name:
+                line += f": selected `{step.selected_name}` (score {step.selected_score:.1f})"
+            if step.stop_reason:
+                line += f"; stopped: {step.stop_reason}"
+            elif step.candidates:
+                line += f"; candidates: {', '.join(step.candidates[:5])}"
+            lines.append(line)
+        lines.append("")
     if not ranked:
         lines.extend(["No candidates were parsed from the supplied key/article.", ""])
         return "\n".join(lines)
@@ -391,6 +587,10 @@ def parse_args() -> argparse.Namespace:
                         help="Local taxon cache used to resolve the observation taxon.")
     parser.add_argument("--observation-id", help="Select this ID from the local observations cache.")
     parser.add_argument("--bhl-token", type=Path, help="Path to a BHL API token file (default: bhl_token.txt).")
+    parser.add_argument("--no-recursive", action="store_true",
+                        help="Run one identification step instead of progressing through narrower ranks.")
+    parser.add_argument("--max-levels", type=int, default=6,
+                        help="Maximum number of narrower taxonomic steps (default: 6).")
     parser.add_argument("--output", type=Path, default=Path("identification_report.md"))
     parser.add_argument("--json-output", type=Path, help="Also write machine-readable JSON.")
     return parser.parse_args()
@@ -398,6 +598,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.max_levels < 1:
+        raise ValueError("--max-levels must be positive")
     observation: dict[str, Any] = {}
     if args.observation_id:
         observation.update(load_local_observation(args.observations_file,
@@ -411,29 +613,36 @@ def main() -> int:
 
     if args.source == "bhl":
         token = load_bhl_token([args.bhl_token] if args.bhl_token else [Path("bhl_token.txt")])
-        queries = bhl_search_queries(observation)
-        bhl_sources: list[str] = []
-        for query in queries:
-            bhl_sources.extend(bhl_search_articles(query, token, max_results=3))
-        if not bhl_sources:
-            article_sources = list(args.article_sources or [])
+        if args.no_recursive:
+            article_sources, queries = sources_for_step(observation, "bhl", [], token)
             if not article_sources:
-                raise ValueError("BHL search returned no results. Provide --source local with --article or add a BHL token.")
+                raise ValueError(
+                    "BHL search returned no usable sources for the cached taxonomy."
+                )
         else:
-            article_sources = bhl_sources
+            article_sources = []
     else:
+        token = None
         article_sources = list(args.article_sources or [])
         if not article_sources:
             raise ValueError("--source local requires at least one --article value.")
 
-    candidates = [candidate for source in article_sources for candidate in parse_key_source(source)]
-    ranked = rank_candidates(candidates, observation)
-    args.output.write_text(render_markdown(observation, ranked), encoding="utf-8")
+    if args.no_recursive:
+        candidates = [candidate for source in article_sources for candidate in parse_key_source(source)]
+        ranked = rank_candidates(candidates, observation)
+        steps: list[TaxonomicStep] = []
+    else:
+        ranked, steps = recursive_identification(
+            observation, args.source, article_sources, token, args.max_levels
+        )
+    report = render_markdown(observation, ranked, steps)
+    args.output.write_text(report, encoding="utf-8")
     if args.json_output:
         args.json_output.write_text(json.dumps({"observation": observation,
-                                                 "candidates": [candidate.__dict__ for candidate in ranked]},
+                                                 "candidates": [candidate.__dict__ for candidate in ranked],
+                                                 "taxonomic_steps": [step.__dict__ for step in steps]},
                                                 indent=2, ensure_ascii=False), encoding="utf-8")
-    print(render_markdown(observation, ranked))
+    print(report)
     return 0
 
 
