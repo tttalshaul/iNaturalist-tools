@@ -641,7 +641,23 @@ def create_html_report(
     matched_results = sort_items(matched_results, sort_by=sort_by, sort_order=sort_order, group_by_dir=group_by_dir, item_type="matched")
     local_missing = sort_items(local_missing, sort_by=sort_by, sort_order=sort_order, group_by_dir=group_by_dir, item_type="unmatched")
 
+    observation_photo_paths = {}
+    for result in matched_results:
+        observation_id = str(result.get("observation_id", ""))
+        if not observation_id:
+            continue
+        paths = observation_photo_paths.setdefault(observation_id, [])
+        for image_path in result.get("local_images", []):
+            absolute_path = str(Path(image_path).resolve())
+            if absolute_path not in paths:
+                paths.append(absolute_path)
+    (output_dir / "observation_photo_paths.json").write_text(
+        json.dumps(observation_photo_paths, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
     matched_count = len(matched_results)
+    matched_obs_count = len(observation_photo_paths)
     unmatched_count = len(local_missing)
     total_count = matched_count + unmatched_count
 
@@ -837,6 +853,25 @@ h1 {{
 .tab-btn.active {{
     background: #28a745;
     color: white;
+}}
+.filter-summary {{
+    background: #eef4fc;
+    border: 1px solid #d0e1fd;
+    border-left: 4px solid #007bff;
+    padding: 10px 16px;
+    border-radius: 6px;
+    margin-bottom: 15px;
+    font-size: 15px;
+    font-weight: 500;
+    color: #1e3a5f;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 15px;
+}}
+.filter-summary b {{
+    color: #0d47a1;
+    font-size: 16px;
 }}
 table {{
     border-collapse: collapse;
@@ -1110,6 +1145,12 @@ function filterTable() {{
     let selectedCameraNames = Array.from(document.getElementById("camera-name-filter").selectedOptions).map(option => option.value);
     let rows = document.querySelectorAll("#results tbody tr");
 
+    let countUnmatched = 0;
+    let countMatchedPhotos = 0;
+    let matchedObsSet = new Set();
+    let countAllPhotos = 0;
+    let allObsSet = new Set();
+
     rows.forEach(function(row) {{
         let isMatched = row.dataset.matched === "true";
         let isNonLive = row.classList.contains("non-live-row");
@@ -1117,15 +1158,7 @@ function filterTable() {{
         let isLandscape = row.dataset.landscape === "true";
         let isFlagged = isHuman || isLandscape;
         let isCurrentYear = (row.dataset.timestamp || "").slice(0, 4) === currentYear;
-
-        let matchesTab = false;
-        if (currentTab === "all") {{
-            matchesTab = true;
-        }} else if (currentTab === "unmatched" && !isMatched) {{
-            matchesTab = true;
-        }} else if (currentTab === "matched" && isMatched) {{
-            matchesTab = true;
-        }}
+        let obsId = row.dataset.obsId || "";
 
         let matchesSearch = !text || row.innerText.toLowerCase().includes(text);
         let matchesNonLiveFilter = !hideNonLive || !isNonLive;
@@ -1141,20 +1174,69 @@ function filterTable() {{
         let matchesCameraType = !selectedCameraTypes.length || selectedCameraTypes.some(value => rowCameraTypes.includes(value));
         let matchesCameraName = !selectedCameraNames.length || selectedCameraNames.some(value => rowCameraNames.includes(value));
 
-        row.dataset.hidden = !(matchesTab && matchesSearch && matchesNonLiveFilter && matchesCurrentYearFilter && matchesFlagFilter && matchesCameraType && matchesCameraName);
+        let passesFilters = matchesSearch && matchesNonLiveFilter && matchesCurrentYearFilter && matchesFlagFilter && matchesCameraType && matchesCameraName;
+
+        if (passesFilters) {{
+            countAllPhotos++;
+            if (obsId) allObsSet.add(obsId);
+            if (isMatched) {{
+                countMatchedPhotos++;
+                if (obsId) matchedObsSet.add(obsId);
+            }} else {{
+                countUnmatched++;
+            }}
+        }}
+
+        let matchesTab = false;
+        if (currentTab === "all") {{
+            matchesTab = true;
+        }} else if (currentTab === "unmatched" && !isMatched) {{
+            matchesTab = true;
+        }} else if (currentTab === "matched" && isMatched) {{
+            matchesTab = true;
+        }}
+
+        row.dataset.hidden = !(passesFilters && matchesTab);
     }});
 
-    showPage(currentPage);
+    let tabUnmatchedBtn = document.getElementById("tab-unmatched");
+    if (tabUnmatchedBtn) {{
+        tabUnmatchedBtn.innerText = "Unmatched Local Photos (" + countUnmatched + ")";
+    }}
+    let tabMatchedBtn = document.getElementById("tab-matched");
+    if (tabMatchedBtn) {{
+        tabMatchedBtn.innerText = "Matched Observations (" + matchedObsSet.size + " obs / " + countMatchedPhotos + " photos)";
+    }}
+    let tabAllBtn = document.getElementById("tab-all");
+    if (tabAllBtn) {{
+        tabAllBtn.innerText = "All Photos (" + countAllPhotos + ")";
+    }}
+
+    let filterSummary = document.getElementById("filter-summary");
+    if (filterSummary) {{
+        if (currentTab === "matched") {{
+            filterSummary.innerHTML = "<span>Matched Observations for current filter: <b>" + matchedObsSet.size + "</b> (" + countMatchedPhotos + " photos)</span>";
+        }} else if (currentTab === "all") {{
+            filterSummary.innerHTML = "<span>Visible Photos for current filter: <b>" + countAllPhotos + "</b> | Total Matched Observations: <b>" + allObsSet.size + "</b></span>";
+        }} else {{
+            filterSummary.innerHTML = "<span>Unmatched Photos for current filter: <b>" + countUnmatched + "</b> (0 observations)</span>";
+        }}
+    }}
+
+    showPage(0);
 }}
 
 function showPage(page) {{
     currentPage = page;
     let rows = document.querySelectorAll("#results tbody tr");
     let visibleRows = [];
+    let uniqueObs = new Set();
 
     rows.forEach(function(row) {{
         if (row.dataset.hidden !== "true") {{
             visibleRows.push(row);
+            let obsId = row.dataset.obsId;
+            if (obsId) uniqueObs.add(obsId);
         }}
         row.style.display = "none";
     }});
@@ -1166,9 +1248,17 @@ function showPage(page) {{
         row.style.display = "";
     }});
 
-    document.getElementById("page_info").innerText =
-        "Page " + (page + 1) + " / " + Math.max(1, Math.ceil(visibleRows.length / pageSize)) +
-        " (" + visibleRows.length + " visible)";
+    let obsText = "";
+    if (uniqueObs.size > 0) {{
+        obsText = ", " + uniqueObs.size + " observations";
+    }}
+
+    let pageText = "Page " + (page + 1) + " / " + Math.max(1, Math.ceil(visibleRows.length / pageSize)) +
+        " (" + visibleRows.length + " visible photos" + obsText + ")";
+
+    document.querySelectorAll(".page_info").forEach(function(el) {{
+        el.innerText = pageText;
+    }});
 }}
 
 function nextPage() {{
@@ -1256,13 +1346,15 @@ window.onload = function() {{
 
 <div class="tabs">
     <button class="tab-btn active" id="tab-unmatched" onclick="switchTab('unmatched')">Unmatched Local Photos ({unmatched_count})</button>
-    <button class="tab-btn" id="tab-matched" onclick="switchTab('matched')">Matched Observations ({matched_count})</button>
+    <button class="tab-btn" id="tab-matched" onclick="switchTab('matched')">Matched Observations ({matched_obs_count} obs / {matched_count} photos)</button>
     <button class="tab-btn" id="tab-all" onclick="switchTab('all')">All Photos ({total_count})</button>
 </div>
 
+<div id="filter-summary" class="filter-summary"></div>
+
 <div class="pagination">
     <button class="btn btn-secondary" onclick="previousPage()">Previous</button>
-    <span id="page_info"></span>
+    <span class="page_info" id="page_info"></span>
     <button class="btn btn-secondary" onclick="nextPage()">Next</button>
 </div>
 
@@ -1327,7 +1419,8 @@ window.onload = function() {{
             ])
 
             inat_file = esc(r.get("inat_original_filename", ""))
-            obs_id = esc(r.get("observation_id", ""))
+            obs_id = esc(str(r.get("observation_id", "")))
+            obs_link = f'<a href="https://www.inaturalist.org/observations/{obs_id}" target="_blank" rel="noopener noreferrer">{obs_id}</a>' if obs_id else ""
             raw_ts = r.get("timestamp") or r.get("inat_timestamp") or ""
             timestamp = esc(raw_ts)
             display_ts = esc(raw_ts.replace("T", " "))
@@ -1346,11 +1439,11 @@ window.onload = function() {{
             row_human = "true" if any(img.get("human") for img in local_image_data) else "false"
             row_landscape = "true" if any(img.get("landscape") for img in local_image_data) else "false"
 
-            f.write(f'<tr data-matched="true" data-path="{esc(first_path)}" data-dir="{dir_path}" data-filename="{inat_file}" data-timestamp="{timestamp}" data-camera-types="{camera_types_json}" data-camera-names="{camera_names_json}" data-human="{row_human}" data-landscape="{row_landscape}">')
+            f.write(f'<tr data-matched="true" data-obs-id="{obs_id}" data-path="{esc(first_path)}" data-dir="{dir_path}" data-filename="{inat_file}" data-timestamp="{timestamp}" data-camera-types="{camera_types_json}" data-camera-names="{camera_names_json}" data-human="{row_human}" data-landscape="{row_landscape}">')
             f.write(f'<td><b>[MATCHED]</b><br>{inat_file}</td>')
             f.write(f'<td>{thumbs_html}</td>')
             f.write(f'<td><b>Local Files:</b><br>{local_names_html}{flags_html}</td>')
-            f.write(f'<td><b>Obs ID:</b> {obs_id}<br><b>Date:</b> {display_ts}</td>')
+            f.write(f'<td><b>Obs ID:</b> {obs_link}<br><b>Date:</b> {display_ts}</td>')
             f.write('<td><span style="color:#28a745; font-weight:bold;">Matched to iNat</span></td>')
             f.write('</tr>\n')
 
@@ -1361,7 +1454,7 @@ window.onload = function() {{
 
 <div class="pagination">
     <button class="btn btn-secondary" onclick="previousPage()">Previous</button>
-    <span id="page_info"></span>
+    <span class="page_info" id="page_info_bottom"></span>
     <button class="btn btn-secondary" onclick="nextPage()">Next</button>
 </div>
 
@@ -1804,29 +1897,31 @@ def extract_exif_datetime(path):
     try:
         img = Image.open(path)
         exif = img.getexif()
-        candidates = []
+        tag_dict = {}
         if exif:
             for key, value in exif.items():
-                candidates.append((ExifTags.TAGS.get(key), value))
+                tag_dict[ExifTags.TAGS.get(key, key)] = value
 
             try:
                 exif_ifd = exif.get_ifd(ExifTags.IFD.Exif)
                 if exif_ifd:
                     for key, value in exif_ifd.items():
-                        candidates.append((ExifTags.TAGS.get(key), value))
+                        tag_dict[ExifTags.TAGS.get(key, key)] = value
             except Exception:
                 pass
 
-        if not candidates and hasattr(img, "_getexif"):
+        if not tag_dict and hasattr(img, "_getexif"):
             try:
                 raw_exif = img._getexif() or {}
                 for key, value in raw_exif.items():
-                    candidates.append((ExifTags.TAGS.get(key), value))
+                    tag_dict[ExifTags.TAGS.get(key, key)] = value
             except Exception:
                 pass
 
-        for tag, value in candidates:
-            if tag in ("DateTimeOriginal", "DateTimeDigitized", "DateTime") and isinstance(value, str):
+        # Priority order: DateTimeOriginal (capture time) -> DateTimeDigitized -> DateTime (modification/export time)
+        for tag_name in ("DateTimeOriginal", "DateTimeDigitized", "DateTime"):
+            value = tag_dict.get(tag_name)
+            if isinstance(value, str):
                 cleaned = value.strip().rstrip("\x00")
                 for fmt in (
                     "%Y:%m:%d %H:%M:%S",
@@ -2159,6 +2254,56 @@ def build_local_indexes(
 # ======================================================
 
 
+def is_candidate_compatible(candidate, inat_dt, max_hours=72):
+    """
+    Check if a candidate local image is compatible with an iNaturalist photo's timestamp.
+    If either has no timestamp/date info, returns True (cannot disprove compatibility).
+    If both have timestamp/date info, verifies they are within max_hours (default 72h / 3 days)
+    to prevent false cross-trip matches across different dates/years while tolerating
+    camera clock drift, timezone shifts, and export date offsets.
+    """
+    if inat_dt is None:
+        return True
+
+    # 1. Check folder/path date if available
+    cand_path_date_str = parse_date_from_path(candidate.get("path"))
+    if cand_path_date_str:
+        try:
+            cand_p_date = datetime.strptime(cand_path_date_str, "%Y-%m-%d").date()
+            inat_date = inat_dt.date() if hasattr(inat_dt, "date") else None
+            if inat_date and abs((cand_p_date - inat_date).days) <= 3:
+                return True
+        except Exception:
+            pass
+
+    # 2. Check candidate timestamp (EXIF)
+    cand_ts_str = candidate.get("timestamp")
+    if cand_ts_str:
+        try:
+            cand_dt = datetime.fromisoformat(cand_ts_str)
+            cand_naive = cand_dt.replace(tzinfo=None) if getattr(cand_dt, "tzinfo", None) is not None else cand_dt
+            inat_naive = inat_dt.replace(tzinfo=None) if getattr(inat_dt, "tzinfo", None) is not None else inat_dt
+            diff_seconds = abs((cand_naive - inat_naive).total_seconds())
+            return diff_seconds <= (max_hours * 3600)
+        except Exception:
+            pass
+
+    # 3. Check candidate date (EXIF or path)
+    cand_date_str = get_candidate_date(candidate)
+    if cand_date_str:
+        try:
+            cand_date = datetime.strptime(cand_date_str[:10], "%Y-%m-%d").date()
+            inat_date = inat_dt.date() if hasattr(inat_dt, "date") else None
+            if inat_date:
+                day_diff = abs((cand_date - inat_date).days)
+                max_days = max(1, (max_hours + 23) // 24)
+                return day_diff <= max_days
+        except Exception:
+            pass
+
+    return True
+
+
 def match_single_photo(
         inat_photo,
         filename_index):
@@ -2184,8 +2329,6 @@ def match_single_photo(
         []
     )
 
-
-
     # --------------------------------------------------
     # No local file with this name
     # --------------------------------------------------
@@ -2206,13 +2349,29 @@ def match_single_photo(
 
         }
 
+    inat_dt = inat_photo.get("timestamp")
 
+    # Filter out candidates from completely different dates/trips
+    compatible_candidates = [
+        c for c in candidates
+        if is_candidate_compatible(c, inat_dt)
+    ]
+
+    if not compatible_candidates:
+        return {
+            "status":
+                "NOT_FOUND",
+            "local_image":
+                None,
+            "match_method":
+                None
+        }
 
     # --------------------------------------------------
-    # Exactly one filename match
+    # Exactly one compatible filename match
     # --------------------------------------------------
 
-    if len(candidates) == 1:
+    if len(compatible_candidates) == 1:
 
 
         return {
@@ -2221,7 +2380,7 @@ def match_single_photo(
                 "MATCHED",
 
             "local_image":
-                candidates[0],
+                compatible_candidates[0],
 
             "match_method":
                 "filename"
@@ -2231,12 +2390,11 @@ def match_single_photo(
 
 
     # --------------------------------------------------
-    # Multiple identical filenames
+    # Multiple identical filenames within compatible timeframe
     # Use timestamp
     # --------------------------------------------------
 
-
-    inat_dt = inat_photo.get("timestamp")
+    candidates = compatible_candidates
     inat_time = timestamp_minute(inat_dt)
 
     if inat_time:
@@ -2266,7 +2424,9 @@ def match_single_photo(
                 if cand_ts_str:
                     try:
                         cand_dt = datetime.fromisoformat(cand_ts_str)
-                        diff = abs((cand_dt - inat_dt).total_seconds())
+                        cand_naive = cand_dt.replace(tzinfo=None) if getattr(cand_dt, "tzinfo", None) is not None else cand_dt
+                        inat_naive = inat_dt.replace(tzinfo=None) if getattr(inat_dt, "tzinfo", None) is not None else inat_dt
+                        diff = abs((cand_naive - inat_naive).total_seconds())
                         if diff <= 7200:  # within 2 hours (1-2 hr timezone/DST shift)
                             near_matches.append(candidate)
                     except Exception:
@@ -2292,14 +2452,16 @@ def match_single_photo(
                     "match_method": "filename+same_date"
                 }
 
-            # Fallback: Closest timestamp match if best candidate is within 48h and significantly closer than others
+            # Fallback: Closest timestamp match if best candidate is within 6h and significantly closer than others
             cand_diffs = []
             for candidate in candidates:
                 cand_ts_str = candidate.get("timestamp")
                 if cand_ts_str:
                     try:
                         cand_dt = datetime.fromisoformat(cand_ts_str)
-                        diff_seconds = abs((cand_dt - inat_dt).total_seconds())
+                        cand_naive = cand_dt.replace(tzinfo=None) if getattr(cand_dt, "tzinfo", None) is not None else cand_dt
+                        inat_naive = inat_dt.replace(tzinfo=None) if getattr(inat_dt, "tzinfo", None) is not None else inat_dt
+                        diff_seconds = abs((cand_naive - inat_naive).total_seconds())
                         cand_diffs.append((diff_seconds, candidate))
                     except Exception:
                         pass
@@ -2308,8 +2470,8 @@ def match_single_photo(
                 cand_diffs.sort(key=lambda x: x[0])
                 best_diff, best_cand = cand_diffs[0]
                 second_best_diff = cand_diffs[1][0] if len(cand_diffs) > 1 else float("inf")
-                # If best match is within 48h and at least 12h closer than the next best candidate
-                if best_diff <= 172800 and (second_best_diff - best_diff >= 43200):
+                # If best match is within 6h and at least 6h closer than the next best candidate
+                if best_diff <= 21600 and (second_best_diff - best_diff >= 21600):
                     return {
                         "status": "MATCHED",
                         "local_image": best_cand,
@@ -2338,6 +2500,7 @@ def match_single_photo(
             None
 
     }
+
 
 
 
@@ -3401,6 +3564,10 @@ def main():
         sort_by=args.sort_by,
         sort_order=args.sort_order,
         group_by_dir=not args.no_group_by_dir
+    )
+    print(
+        "Observation photo paths written to:",
+        (Path(args.output_dir) / "observation_photo_paths.json").resolve(),
     )
 
 
