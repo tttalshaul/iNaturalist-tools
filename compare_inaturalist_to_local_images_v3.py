@@ -7,6 +7,7 @@ import time
 import argparse
 import subprocess
 import html
+import re
 import shutil
 from pathlib import Path
 import hashlib
@@ -587,6 +588,36 @@ def parse_date_to_timestamp(val):
     return None
 
 
+def extract_year(val):
+    if not val:
+        return ""
+    if isinstance(val, (int, float)):
+        try:
+            return str(datetime.fromtimestamp(val).year)
+        except Exception:
+            return ""
+    if isinstance(val, datetime):
+        return str(val.year)
+    if isinstance(val, str):
+        val = val.strip()
+        if not val:
+            return ""
+        if len(val) >= 4 and val[:4].isdigit():
+            y = int(val[:4])
+            if 1900 <= y <= 2100:
+                return str(y)
+        epoch = parse_date_to_timestamp(val)
+        if epoch:
+            try:
+                return str(datetime.fromtimestamp(epoch).year)
+            except Exception:
+                pass
+        m = re.search(r'\b(19\d\d|20\d\d)\b', val)
+        if m:
+            return m.group(1)
+    return ""
+
+
 def sort_items(items, sort_by="date", sort_order="asc", group_by_dir=True, item_type="unmatched"):
     reverse = (sort_order == "desc")
 
@@ -659,6 +690,7 @@ def create_html_report(
     matched_count = len(matched_results)
     matched_obs_count = len(observation_photo_paths)
     unmatched_count = len(local_missing)
+    non_live_count = sum(1 for image in local_missing if image.get("non_live"))
     total_count = matched_count + unmatched_count
 
     thumbnail_paths = []
@@ -746,6 +778,30 @@ def create_html_report(
         f'<option value="{esc(value)}">{esc(value)}</option>'
         for value in sorted(camera_names, key=str.casefold)
     )
+
+    obs_years = set()
+    has_unknown_year = False
+    for image in local_missing:
+        raw_ts = image.get("timestamp") or image.get("timestamp_minute") or ""
+        y = extract_year(raw_ts)
+        if y:
+            obs_years.add(y)
+        else:
+            has_unknown_year = True
+    for result in matched_results:
+        raw_ts = result.get("timestamp") or result.get("inat_timestamp") or ""
+        y = extract_year(raw_ts)
+        if y:
+            obs_years.add(y)
+        else:
+            has_unknown_year = True
+
+    year_options_list = ['<option value="all">All years</option>']
+    for y in sorted(obs_years, key=lambda val: int(val) if val.isdigit() else 0, reverse=True):
+        year_options_list.append(f'<option value="{esc(y)}">{esc(y)}</option>')
+    if has_unknown_year:
+        year_options_list.append('<option value="unknown">Unknown</option>')
+    year_options = "".join(year_options_list)
 
     sort_by_date_sel = 'selected' if sort_by == 'date' else ''
     sort_by_fn_sel = 'selected' if sort_by == 'filename' else ''
@@ -929,68 +985,223 @@ const pageSize = 100;
 let currentTab = "unmatched";
 
 let nonLivePaths = new Set();
+let nonLiveNormalizedPaths = new Set();
 let nonLiveSignatures = new Set();
+let rowRecords = [];
+let currentFilteredRecords = [];
+let currentlyDisplayedRows = [];
+let saveStoreTimeout = null;
+
+function normalizePathKey(p) {{
+    return String(p || "").split(String.fromCharCode(92)).join("/").replace(/\\/+$/g, "").toLowerCase();
+}}
+
+function signatureKey(s) {{
+    if (s == null || s === "") return "";
+    if (typeof s === "string") return s;
+    if (Array.isArray(s) && s.length >= 2) return String(s[0]) + ":" + String(s[1]);
+    if (typeof s === "object") {{
+        if ("size" in s && "mtime" in s) return String(s.size) + ":" + String(s.mtime);
+        if (0 in s && 1 in s) return String(s[0]) + ":" + String(s[1]);
+    }}
+    return String(s);
+}}
+
+function pathIsNonLive(path) {{
+    if (!path) return false;
+    if (nonLivePaths.has(path)) return true;
+    let norm = normalizePathKey(path);
+    return !!(norm && nonLiveNormalizedPaths.has(norm));
+}}
+
+function isRowNonLive(row) {{
+    if (!row) return false;
+    let path = row.dataset.path || "";
+    if (path && (nonLivePaths.has(path) || (row._normPath ? nonLiveNormalizedPaths.has(row._normPath) : pathIsNonLive(path)))) return true;
+    let sig = row._sig !== undefined ? row._sig : signatureKey(row.dataset.signature || "");
+    if (sig && nonLiveSignatures.has(sig)) return true;
+    return false;
+}}
+
+function setRowNonLiveState(row, btn, isNonLive) {{
+    if (!row) return;
+    row.dataset.nonLive = isNonLive ? "true" : "false";
+    if (isNonLive) {{
+        row.classList.add("non-live-row");
+    }} else {{
+        row.classList.remove("non-live-row");
+    }}
+    let badge = row.querySelector(".badge-non-live");
+    if (badge) badge.style.display = isNonLive ? "inline-block" : "none";
+    if (btn) {{
+        if (isNonLive) {{
+            btn.innerText = "🌱 Mark as Live";
+            btn.className = "btn btn-secondary btn-toggle-nonlive";
+        }} else {{
+            btn.innerText = "🚫 Mark Not Live";
+            btn.className = "btn btn-warning btn-toggle-nonlive";
+        }}
+    }}
+}}
 
 function initNonLiveStore() {{
+    let hasSaved = false;
     try {{
         let saved = localStorage.getItem("inat_non_live_photos");
         if (saved) {{
             let data = JSON.parse(saved);
-            if (data.paths) data.paths.forEach(p => nonLivePaths.add(p));
-            if (data.signatures) data.signatures.forEach(s => nonLiveSignatures.add(s));
+            if (data && data.paths && Array.isArray(data.paths)) {{
+                data.paths.forEach(p => {{
+                    nonLivePaths.add(p);
+                    let norm = normalizePathKey(p);
+                    if (norm) nonLiveNormalizedPaths.add(norm);
+                }});
+                hasSaved = true;
+            }}
+            if (data && data.signatures && Array.isArray(data.signatures)) {{
+                data.signatures.forEach(s => {{
+                    let key = signatureKey(s);
+                    if (key) nonLiveSignatures.add(key);
+                }});
+                hasSaved = true;
+            }}
         }}
     }} catch(e) {{
         console.error("Failed to load non-live photos from localStorage", e);
     }}
+
+    if (!hasSaved) {{
+        document.querySelectorAll("#results tbody tr").forEach(function(row) {{
+            if (row.dataset.nonLive === "true" || row.classList.contains("non-live-row")) {{
+                let path = row.dataset.path || "";
+                if (path) {{
+                    nonLivePaths.add(path);
+                    let norm = normalizePathKey(path);
+                    if (norm) nonLiveNormalizedPaths.add(norm);
+                }}
+                let sig = signatureKey(row.dataset.signature || "");
+                if (sig) nonLiveSignatures.add(sig);
+            }}
+        }});
+    }}
+}}
+
+function buildRowRecords() {{
+    let rows = document.querySelectorAll("#results tbody tr");
+    rowRecords = [];
+    rows.forEach(function(row, idx) {{
+        let path = row.dataset.path || "";
+        let normPath = normalizePathKey(path);
+        let sig = signatureKey(row.dataset.signature || "");
+        row._normPath = normPath;
+        row._sig = sig;
+
+        let cameraTypes = [];
+        let cameraNames = [];
+        try {{
+            if (row.dataset.cameraTypes) cameraTypes = JSON.parse(row.dataset.cameraTypes);
+            if (row.dataset.cameraNames) cameraNames = JSON.parse(row.dataset.cameraNames);
+        }} catch(e) {{}}
+
+        let filename = row.dataset.filename || "";
+        let obsId = row.dataset.obsId || "";
+        let timestamp = row.dataset.timestamp || "";
+        let year = row.dataset.year || timestamp.slice(0, 4);
+
+        let rec = {{
+            row: row,
+            index: idx,
+            btn: row.querySelector(".btn-toggle-nonlive"),
+            isMatched: row.dataset.matched === "true",
+            path: path,
+            normPath: normPath,
+            sig: sig,
+            dir: (row.dataset.dir || "").toLowerCase(),
+            filenameLower: filename.toLowerCase(),
+            timestamp: timestamp,
+            year: year,
+            obsId: obsId,
+            cameraTypes: cameraTypes,
+            cameraNames: cameraNames,
+            isHuman: row.dataset.human === "true",
+            isLandscape: row.dataset.landscape === "true",
+            isFlagged: (row.dataset.human === "true") || (row.dataset.landscape === "true"),
+            searchText: (filename + " " + path + " " + obsId + " " + timestamp).toLowerCase(),
+            isNonLive: false
+        }};
+        row._rec = rec;
+        row.style.display = "none";
+        rowRecords.push(rec);
+    }});
+}}
+
+function applySavedNonLiveToRows() {{
+    for (let i = 0; i < rowRecords.length; i++) {{
+        let rec = rowRecords[i];
+        let isNonLive = (rec.path && (nonLivePaths.has(rec.path) || (rec.normPath && nonLiveNormalizedPaths.has(rec.normPath)))) ||
+                        (rec.sig && nonLiveSignatures.has(rec.sig));
+        rec.isNonLive = isNonLive;
+        setRowNonLiveState(rec.row, rec.btn, isNonLive);
+    }}
+}}
+
+function scheduleSaveNonLiveStore() {{
+    if (saveStoreTimeout) clearTimeout(saveStoreTimeout);
+    saveStoreTimeout = setTimeout(saveNonLiveStore, 300);
 }}
 
 function saveNonLiveStore() {{
+    if (saveStoreTimeout) {{
+        clearTimeout(saveStoreTimeout);
+        saveStoreTimeout = null;
+    }}
     let payload = {{
         paths: Array.from(nonLivePaths),
         signatures: Array.from(nonLiveSignatures)
     }};
-    localStorage.setItem("inat_non_live_photos", JSON.stringify(payload));
+    try {{
+        localStorage.setItem("inat_non_live_photos", JSON.stringify(payload));
+    }} catch(e) {{
+        console.error("Failed to save to localStorage", e);
+    }}
 }}
 
 function toggleNonLive(btn, path, filename, signature) {{
     let row = btn ? btn.closest("tr") : null;
+    let rec = row ? row._rec : null;
+    if (!path && rec) path = rec.path;
+    if (!signature && rec) signature = rec.sig;
     if (!path && row && row.dataset.path) path = row.dataset.path;
-    if (!filename && row && row.dataset.filename) filename = row.dataset.filename;
     if (!signature && row && row.dataset.signature) signature = row.dataset.signature;
+    signature = signatureKey(signature);
+    let norm = path ? (rec ? rec.normPath : normalizePathKey(path)) : "";
 
-    let isNonLive = (path && nonLivePaths.has(path)) ||
-                    (signature && nonLiveSignatures.has(signature));
+    let currentlyNonLive = rec ? rec.isNonLive : ((path && (nonLivePaths.has(path) || nonLiveNormalizedPaths.has(norm))) || (signature && nonLiveSignatures.has(signature)));
 
-    if (isNonLive) {{
-        if (path) nonLivePaths.delete(path);
+    if (currentlyNonLive) {{
+        if (path) {{
+            nonLivePaths.delete(path);
+            if (norm) nonLiveNormalizedPaths.delete(norm);
+        }}
         if (signature) nonLiveSignatures.delete(signature);
-        if (row) {{
-            row.classList.remove("non-live-row");
-            let badge = row.querySelector(".badge-non-live");
-            if (badge) badge.style.display = "none";
-        }}
-        if (btn) {{
-            btn.innerText = "🚫 Mark Not Live";
-            btn.className = "btn btn-warning btn-toggle-nonlive";
-        }}
+        if (rec) rec.isNonLive = false;
+        if (row) setRowNonLiveState(row, btn, false);
     }} else {{
-        if (path) nonLivePaths.add(path);
+        if (path) {{
+            nonLivePaths.add(path);
+            if (norm) nonLiveNormalizedPaths.add(norm);
+        }}
         if (signature) nonLiveSignatures.add(signature);
-        if (row) {{
-            row.classList.add("non-live-row");
-            let badge = row.querySelector(".badge-non-live");
-            if (badge) badge.style.display = "inline-block";
-        }}
-        if (btn) {{
-            btn.innerText = "🌱 Mark as Live";
-            btn.className = "btn btn-secondary btn-toggle-nonlive";
-        }}
+        if (rec) rec.isNonLive = true;
+        if (row) setRowNonLiveState(row, btn, true);
     }}
-    saveNonLiveStore();
-    filterTable();
+
+    scheduleSaveNonLiveStore();
+    filterTable(true);
 }}
 
 function exportNonLiveJSON() {{
+    saveNonLiveStore();
     let payload = {{
         paths: Array.from(nonLivePaths),
         signatures: Array.from(nonLiveSignatures)
@@ -1011,15 +1222,29 @@ function importNonLiveJSON(event) {{
     reader.onload = function(e) {{
         try {{
             let data = JSON.parse(e.target.result);
+            nonLivePaths.clear();
+            nonLiveNormalizedPaths.clear();
+            nonLiveSignatures.clear();
             if (Array.isArray(data)) {{
-                data.forEach(p => nonLivePaths.add(p));
+                data.forEach(p => {{
+                    nonLivePaths.add(p);
+                    let norm = normalizePathKey(p);
+                    if (norm) nonLiveNormalizedPaths.add(norm);
+                }});
             }} else if (typeof data === "object") {{
-                if (data.paths) data.paths.forEach(p => nonLivePaths.add(p));
-                if (data.signatures) data.signatures.forEach(s => nonLiveSignatures.add(s));
+                if (data.paths) data.paths.forEach(p => {{
+                    nonLivePaths.add(p);
+                    let norm = normalizePathKey(p);
+                    if (norm) nonLiveNormalizedPaths.add(norm);
+                }});
+                if (data.signatures) data.signatures.forEach(s => {{
+                    let key = signatureKey(s);
+                    if (key) nonLiveSignatures.add(key);
+                }});
             }}
             saveNonLiveStore();
             applySavedNonLiveToRows();
-            filterTable();
+            filterTable(false);
             alert("Loaded non-live creature choices successfully!");
         }} catch(err) {{
             alert("Error parsing JSON file: " + err.message);
@@ -1028,34 +1253,46 @@ function importNonLiveJSON(event) {{
     reader.readAsText(file);
 }}
 
-function applySavedNonLiveToRows() {{
-    let rows = document.querySelectorAll("#results tbody tr");
-    rows.forEach(function(row) {{
-        let path = row.dataset.path;
-        let sig = row.dataset.signature;
-        let btn = row.querySelector(".btn-toggle-nonlive");
-        let badge = row.querySelector(".badge-non-live");
-
-        if (btn && (nonLivePaths.has(path) || (sig && nonLiveSignatures.has(sig)))) {{
-            row.classList.add("non-live-row");
-            btn.innerText = "🌱 Mark as Live";
-            btn.className = "btn btn-secondary btn-toggle-nonlive";
-            if (badge) badge.style.display = "inline-block";
-        }}
-    }});
-}}
-
 function switchTab(tab) {{
     currentTab = tab;
     document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
     let activeBtn = document.getElementById("tab-" + tab);
     if (activeBtn) activeBtn.classList.add("active");
-    filterTable();
+    let hideNonLiveLabel = document.getElementById("hide-non-live-label");
+    if (hideNonLiveLabel) {{
+        hideNonLiveLabel.style.display = (tab === "non-live") ? "none" : "";
+    }}
+    filterTable(false);
+}}
+
+function rebuildYearFilter(years, hasUnknown, previousValue) {{
+    let yearFilterEl = document.getElementById("year-filter");
+    if (!yearFilterEl) return previousValue || "all";
+    let yearsArr = Array.from(years).sort(function(a, b) {{
+        let na = parseInt(a, 10);
+        let nb = parseInt(b, 10);
+        if (!isNaN(na) && !isNaN(nb)) return nb - na;
+        return String(b).localeCompare(String(a));
+    }});
+    let html = '<option value="all">All years</option>';
+    yearsArr.forEach(function(y) {{
+        html += '<option value="' + y + '">' + y + '</option>';
+    }});
+    if (hasUnknown) {{
+        html += '<option value="unknown">Unknown</option>';
+    }}
+    yearFilterEl.innerHTML = html;
+    if (previousValue === "all" || (previousValue === "unknown" && hasUnknown) || years.has(previousValue)) {{
+        yearFilterEl.value = previousValue;
+        return previousValue;
+    }}
+    yearFilterEl.value = "all";
+    return "all";
 }}
 
 function onSortChange() {{
     sortTable();
-    filterTable();
+    filterTable(true);
 }}
 
 function parseDateToEpoch(str) {{
@@ -1081,41 +1318,28 @@ function parseDateToEpoch(str) {{
 }}
 
 function sortTable() {{
-    let tbody = document.querySelector("#results tbody");
-    if (!tbody) return;
-    let rows = Array.from(tbody.querySelectorAll("tr"));
-
     let sortBy = document.getElementById("sort-by").value;
     let sortOrder = document.getElementById("sort-order").value;
     let groupByDir = document.getElementById("group-by-dir").checked;
 
-    rows.sort(function(a, b) {{
-        let dirA = (a.dataset.dir || "").toLowerCase();
-        let dirB = (b.dataset.dir || "").toLowerCase();
-
-        let fileA = (a.dataset.filename || "").toLowerCase();
-        let fileB = (b.dataset.filename || "").toLowerCase();
-
-        let dateA = a.dataset.timestamp || "";
-        let dateB = b.dataset.timestamp || "";
-
+    rowRecords.sort(function(a, b) {{
         if (groupByDir) {{
-            let dirCmp = dirA.localeCompare(dirB);
+            let dirCmp = a.dir.localeCompare(b.dir);
             if (dirCmp !== 0) return (sortOrder === "desc" ? -dirCmp : dirCmp);
         }}
 
         let cmp = 0;
         if (sortBy === "filename") {{
-            cmp = fileA.localeCompare(fileB);
+            cmp = a.filenameLower.localeCompare(b.filenameLower);
         }} else if (sortBy === "date") {{
-            let timeA = parseDateToEpoch(dateA);
-            let timeB = parseDateToEpoch(dateB);
+            let timeA = parseDateToEpoch(a.timestamp);
+            let timeB = parseDateToEpoch(b.timestamp);
             if (timeA === null && timeB === null) cmp = 0;
             else if (timeA === null) return 1;
             else if (timeB === null) return -1;
             else cmp = (timeA < timeB ? -1 : (timeA > timeB ? 1 : 0));
         }} else if (sortBy === "dir") {{
-            cmp = dirA.localeCompare(dirB);
+            cmp = a.dir.localeCompare(b.dir);
         }}
 
         if (sortOrder === "desc") {{
@@ -1123,69 +1347,69 @@ function sortTable() {{
         }}
 
         if (cmp === 0) {{
-            cmp = fileA.localeCompare(fileB);
+            cmp = a.filenameLower.localeCompare(b.filenameLower);
         }}
         return cmp;
     }});
 
-    let fragment = document.createDocumentFragment();
-    rows.forEach(function(row) {{
-        fragment.appendChild(row);
-    }});
-    tbody.appendChild(fragment);
+    let tbody = document.querySelector("#results tbody");
+    if (tbody) {{
+        let fragment = document.createDocumentFragment();
+        for (let i = 0; i < rowRecords.length; i++) {{
+            fragment.appendChild(rowRecords[i].row);
+        }}
+        tbody.appendChild(fragment);
+    }}
 }}
 
-function filterTable() {{
-    let text = document.getElementById("search").value.toLowerCase();
-    let hideNonLive = document.getElementById("hide-non-live").checked;
-    let hideCurrentYear = document.getElementById("hide-current-year").checked;
-    let currentYear = String(new Date().getFullYear());
+function filterTable(preservePage) {{
+    let text = document.getElementById("search").value.toLowerCase().trim();
+    let hideNonLiveEl = document.getElementById("hide-non-live");
+    let hideNonLive = hideNonLiveEl ? hideNonLiveEl.checked : false;
+    let yearFilterEl = document.getElementById("year-filter");
+    let selectedYear = yearFilterEl ? yearFilterEl.value : "all";
     let flagFilter = document.getElementById("flag-filter").value;
     let selectedCameraTypes = Array.from(document.getElementById("camera-type-filter").selectedOptions).map(option => option.value);
     let selectedCameraNames = Array.from(document.getElementById("camera-name-filter").selectedOptions).map(option => option.value);
-    let rows = document.querySelectorAll("#results tbody tr");
+
+    let hasCameraTypeFilter = selectedCameraTypes.length > 0;
+    let hasCameraNameFilter = selectedCameraNames.length > 0;
 
     let countUnmatched = 0;
     let countMatchedPhotos = 0;
     let matchedObsSet = new Set();
     let countAllPhotos = 0;
     let allObsSet = new Set();
+    let countNonLive = 0;
+    let nonLiveObsSet = new Set();
+    let tabYears = new Set();
+    let tabHasUnknownYear = false;
 
-    rows.forEach(function(row) {{
-        let isMatched = row.dataset.matched === "true";
-        let isNonLive = row.classList.contains("non-live-row");
-        let isHuman = row.dataset.human === "true";
-        let isLandscape = row.dataset.landscape === "true";
-        let isFlagged = isHuman || isLandscape;
-        let isCurrentYear = (row.dataset.timestamp || "").slice(0, 4) === currentYear;
-        let obsId = row.dataset.obsId || "";
+    let passRecords = [];
 
-        let matchesSearch = !text || row.innerText.toLowerCase().includes(text);
+    for (let i = 0; i < rowRecords.length; i++) {{
+        let item = rowRecords[i];
+        let isMatched = item.isMatched;
+        let isNonLive = item.isNonLive;
+        let isHuman = item.isHuman;
+        let isLandscape = item.isLandscape;
+        let isFlagged = item.isFlagged;
+        let rowYear = item.year;
+
+        let matchesSearch = !text || item.searchText.includes(text);
+        if (!matchesSearch) continue;
+
         let matchesNonLiveFilter = !hideNonLive || !isNonLive;
-        let matchesCurrentYearFilter = !hideCurrentYear || !isCurrentYear;
+
         let matchesFlagFilter = true;
         if (flagFilter === "flagged") matchesFlagFilter = isFlagged;
         else if (flagFilter === "human") matchesFlagFilter = isHuman;
         else if (flagFilter === "landscape") matchesFlagFilter = isLandscape;
         else if (flagFilter === "unflagged") matchesFlagFilter = !isFlagged;
+        if (!matchesFlagFilter) continue;
 
-        let rowCameraTypes = JSON.parse(row.dataset.cameraTypes || "[]");
-        let rowCameraNames = JSON.parse(row.dataset.cameraNames || "[]");
-        let matchesCameraType = !selectedCameraTypes.length || selectedCameraTypes.some(value => rowCameraTypes.includes(value));
-        let matchesCameraName = !selectedCameraNames.length || selectedCameraNames.some(value => rowCameraNames.includes(value));
-
-        let passesFilters = matchesSearch && matchesNonLiveFilter && matchesCurrentYearFilter && matchesFlagFilter && matchesCameraType && matchesCameraName;
-
-        if (passesFilters) {{
-            countAllPhotos++;
-            if (obsId) allObsSet.add(obsId);
-            if (isMatched) {{
-                countMatchedPhotos++;
-                if (obsId) matchedObsSet.add(obsId);
-            }} else {{
-                countUnmatched++;
-            }}
-        }}
+        if (hasCameraTypeFilter && !selectedCameraTypes.some(value => item.cameraTypes.includes(value))) continue;
+        if (hasCameraNameFilter && !selectedCameraNames.some(value => item.cameraNames.includes(value))) continue;
 
         let matchesTab = false;
         if (currentTab === "all") {{
@@ -1194,10 +1418,70 @@ function filterTable() {{
             matchesTab = true;
         }} else if (currentTab === "matched" && isMatched) {{
             matchesTab = true;
+        }} else if (currentTab === "non-live" && isNonLive) {{
+            matchesTab = true;
         }}
 
-        row.dataset.hidden = !(passesFilters && matchesTab);
-    }});
+        let passesExceptYearAndHide = true;
+        let passesExceptYear = matchesNonLiveFilter;
+        let includeInYearList = matchesTab && (currentTab === "non-live" ? passesExceptYearAndHide : passesExceptYear);
+        if (includeInYearList) {{
+            if (rowYear) tabYears.add(rowYear);
+            else tabHasUnknownYear = true;
+        }}
+
+        passRecords.push(item);
+    }}
+
+    selectedYear = rebuildYearFilter(tabYears, tabHasUnknownYear, selectedYear);
+
+    currentFilteredRecords = [];
+
+    for (let i = 0; i < passRecords.length; i++) {{
+        let item = passRecords[i];
+        let matchesYearFilter = true;
+        if (selectedYear === "unknown") {{
+            matchesYearFilter = !item.year;
+        }} else if (selectedYear !== "all") {{
+            matchesYearFilter = (item.year === selectedYear);
+        }}
+
+        if (!matchesYearFilter) continue;
+
+        let isNonLive = item.isNonLive;
+        let passesHideFilter = !hideNonLive || !isNonLive;
+
+        if (passesHideFilter) {{
+            countAllPhotos++;
+            if (item.obsId) allObsSet.add(item.obsId);
+            if (item.isMatched) {{
+                countMatchedPhotos++;
+                if (item.obsId) matchedObsSet.add(item.obsId);
+            }} else {{
+                countUnmatched++;
+            }}
+        }}
+
+        if (isNonLive) {{
+            countNonLive++;
+            if (item.obsId) nonLiveObsSet.add(item.obsId);
+        }}
+
+        let visibleOnTab = false;
+        if (currentTab === "all") {{
+            visibleOnTab = passesHideFilter;
+        }} else if (currentTab === "unmatched" && !item.isMatched) {{
+            visibleOnTab = passesHideFilter;
+        }} else if (currentTab === "matched" && item.isMatched) {{
+            visibleOnTab = passesHideFilter;
+        }} else if (currentTab === "non-live" && isNonLive) {{
+            visibleOnTab = true;
+        }}
+
+        if (visibleOnTab) {{
+            currentFilteredRecords.push(item);
+        }}
+    }}
 
     let tabUnmatchedBtn = document.getElementById("tab-unmatched");
     if (tabUnmatchedBtn) {{
@@ -1211,6 +1495,10 @@ function filterTable() {{
     if (tabAllBtn) {{
         tabAllBtn.innerText = "All Photos (" + countAllPhotos + ")";
     }}
+    let tabNonLiveBtn = document.getElementById("tab-non-live");
+    if (tabNonLiveBtn) {{
+        tabNonLiveBtn.innerText = "Non Live Marked Photos Only (" + countNonLive + ")";
+    }}
 
     let filterSummary = document.getElementById("filter-summary");
     if (filterSummary) {{
@@ -1218,43 +1506,51 @@ function filterTable() {{
             filterSummary.innerHTML = "<span>Matched Observations for current filter: <b>" + matchedObsSet.size + "</b> (" + countMatchedPhotos + " photos)</span>";
         }} else if (currentTab === "all") {{
             filterSummary.innerHTML = "<span>Visible Photos for current filter: <b>" + countAllPhotos + "</b> | Total Matched Observations: <b>" + allObsSet.size + "</b></span>";
+        }} else if (currentTab === "non-live") {{
+            let obsText = nonLiveObsSet.size > 0 ? " | Observations: <b>" + nonLiveObsSet.size + "</b>" : " (0 observations)";
+            filterSummary.innerHTML = "<span>Non-live marked photos for current filter: <b>" + countNonLive + "</b>" + obsText + "</span>";
         }} else {{
             filterSummary.innerHTML = "<span>Unmatched Photos for current filter: <b>" + countUnmatched + "</b> (0 observations)</span>";
         }}
     }}
 
-    showPage(0);
+    showPage(preservePage === true ? currentPage : 0);
 }}
 
 function showPage(page) {{
+    let totalPages = Math.max(1, Math.ceil(currentFilteredRecords.length / pageSize));
+    if (page < 0) page = 0;
+    if (page >= totalPages) page = totalPages - 1;
     currentPage = page;
-    let rows = document.querySelectorAll("#results tbody tr");
-    let visibleRows = [];
-    let uniqueObs = new Set();
 
-    rows.forEach(function(row) {{
-        if (row.dataset.hidden !== "true") {{
-            visibleRows.push(row);
-            let obsId = row.dataset.obsId;
-            if (obsId) uniqueObs.add(obsId);
-        }}
-        row.style.display = "none";
-    }});
+    for (let i = 0; i < currentlyDisplayedRows.length; i++) {{
+        currentlyDisplayedRows[i].style.display = "none";
+    }}
+    currentlyDisplayedRows = [];
 
-    let start = page * pageSize;
+    let start = currentPage * pageSize;
     let end = start + pageSize;
+    let pageRecords = currentFilteredRecords.slice(start, end);
 
-    visibleRows.slice(start, end).forEach(function(row) {{
-        row.style.display = "";
-    }});
+    let uniqueObs = new Set();
+    for (let i = 0; i < currentFilteredRecords.length; i++) {{
+        let obsId = currentFilteredRecords[i].obsId;
+        if (obsId) uniqueObs.add(obsId);
+    }}
+
+    for (let i = 0; i < pageRecords.length; i++) {{
+        let r = pageRecords[i].row;
+        r.style.display = "";
+        currentlyDisplayedRows.push(r);
+    }}
 
     let obsText = "";
     if (uniqueObs.size > 0) {{
         obsText = ", " + uniqueObs.size + " observations";
     }}
 
-    let pageText = "Page " + (page + 1) + " / " + Math.max(1, Math.ceil(visibleRows.length / pageSize)) +
-        " (" + visibleRows.length + " visible photos" + obsText + ")";
+    let pageText = "Page " + (currentPage + 1) + " / " + totalPages +
+        " (" + currentFilteredRecords.length + " visible photos" + obsText + ")";
 
     document.querySelectorAll(".page_info").forEach(function(el) {{
         el.innerText = pageText;
@@ -1262,20 +1558,24 @@ function showPage(page) {{
 }}
 
 function nextPage() {{
-    let rows = document.querySelectorAll("#results tbody tr");
-    let count = 0;
-    rows.forEach(row => {{ if (row.dataset.hidden !== "true") count++; }});
-    if ((currentPage + 1) * pageSize < count) showPage(currentPage + 1);
+    let totalPages = Math.ceil(currentFilteredRecords.length / pageSize);
+    if (currentPage + 1 < totalPages) {{
+        showPage(currentPage + 1);
+    }}
 }}
 
 function previousPage() {{
-    if (currentPage > 0) showPage(currentPage - 1);
+    if (currentPage > 0) {{
+        showPage(currentPage - 1);
+    }}
 }}
 
 window.onload = function() {{
     initNonLiveStore();
+    buildRowRecords();
     applySavedNonLiveToRows();
     switchTab("unmatched");
+    window.addEventListener("beforeunload", saveNonLiveStore);
 }};
 </script>
 </head>
@@ -1322,12 +1622,15 @@ window.onload = function() {{
         <input type="checkbox" id="group-by-dir" onchange="onSortChange()" {group_by_dir_chk}> Group by Directory
     </label>
 
-    <label style="font-weight: 500; cursor: pointer; display: flex; align-items: center; gap: 5px;">
+    <label id="hide-non-live-label" style="font-weight: 500; cursor: pointer; display: flex; align-items: center; gap: 5px;">
         <input type="checkbox" id="hide-non-live" onchange="filterTable()" checked> Hide non-live marked photos
     </label>
 
-    <label style="font-weight: 500; cursor: pointer; display: flex; align-items: center; gap: 5px;">
-        <input type="checkbox" id="hide-current-year" onchange="filterTable()"> Hide current year photos
+    <label style="font-weight: 500; display: flex; align-items: center; gap: 5px;">
+        Observation year:
+        <select id="year-filter" onchange="filterTable()">
+            {year_options}
+        </select>
     </label>
 
     <label style="font-weight: 500; display: flex; align-items: center; gap: 5px;">
@@ -1348,6 +1651,7 @@ window.onload = function() {{
     <button class="tab-btn active" id="tab-unmatched" onclick="switchTab('unmatched')">Unmatched Local Photos ({unmatched_count})</button>
     <button class="tab-btn" id="tab-matched" onclick="switchTab('matched')">Matched Observations ({matched_obs_count} obs / {matched_count} photos)</button>
     <button class="tab-btn" id="tab-all" onclick="switchTab('all')">All Photos ({total_count})</button>
+    <button class="tab-btn" id="tab-non-live" onclick="switchTab('non-live')">Non Live Marked Photos Only ({non_live_count})</button>
 </div>
 
 <div id="filter-summary" class="filter-summary"></div>
@@ -1383,6 +1687,7 @@ window.onload = function() {{
             norm_filename = esc(image.get("filename", ""))
             raw_ts = image.get("timestamp") or image.get("timestamp_minute") or ""
             timestamp = esc(raw_ts)
+            item_year = esc(extract_year(raw_ts))
             display_ts = esc(raw_ts.replace("T", " "))
             camera_types_json = esc(json.dumps([image["camera_type"]] if image.get("camera_type") else []))
             camera_names_json = esc(json.dumps([image["camera_name"]] if image.get("camera_name") else []))
@@ -1391,14 +1696,34 @@ window.onload = function() {{
 
             is_human = "true" if image.get("human") else "false"
             is_landscape = "true" if image.get("landscape") else "false"
-            badges_html = " ".join(part for part in [human_badge, landscape_badge] if part)
+            is_non_live = bool(image.get("non_live"))
+            non_live_attr = "true" if is_non_live else "false"
+            row_class = ' class="non-live-row"' if is_non_live else ""
+            non_live_badge = (
+                '<span class="badge-non-live" style="display:inline-block;">Non-live</span>'
+                if is_non_live
+                else '<span class="badge-non-live" style="display:none;">Non-live</span>'
+            )
+            badges_html = " ".join(part for part in [human_badge, landscape_badge, non_live_badge] if part)
+            signature = image.get("signature") or {}
+            sig_attr = esc(f"{signature.get('size', '')}:{signature.get('mtime', '')}")
+            if is_non_live:
+                action_btn = '<button class="btn btn-secondary btn-toggle-nonlive" onclick="toggleNonLive(this)">🌱 Mark as Live</button>'
+            else:
+                action_btn = '<button class="btn btn-warning btn-toggle-nonlive" onclick="toggleNonLive(this)">🚫 Mark Not Live</button>'
 
-            f.write(f'<tr data-matched="false" data-path="{img_path}" data-dir="{dir_path}" data-filename="{orig_name}" data-timestamp="{timestamp}" data-camera-types="{camera_types_json}" data-camera-names="{camera_names_json}" data-human="{is_human}" data-landscape="{is_landscape}">')
+            f.write(
+                f'<tr{row_class} data-matched="false" data-non-live="{non_live_attr}" '
+                f'data-path="{img_path}" data-dir="{dir_path}" data-filename="{orig_name}" '
+                f'data-timestamp="{timestamp}" data-year="{item_year}" data-signature="{sig_attr}" '
+                f'data-camera-types="{camera_types_json}" data-camera-names="{camera_names_json}" '
+                f'data-human="{is_human}" data-landscape="{is_landscape}">'
+            )
             f.write(f'<td><b>[UNMATCHED]</b><br>{orig_name} {badges_html}</td>')
             f.write(f'<td><img src="thumbnails/local/{esc(thumb_name)}"></td>')
             f.write(f'<td>{img_path}</td>')
             f.write(f'<td>{display_ts}</td>')
-            f.write('<td><button class="btn btn-warning btn-toggle-nonlive" onclick="toggleNonLive(this)">🚫 Mark Not Live</button></td>')
+            f.write(f'<td>{action_btn}</td>')
             f.write('</tr>\n')
 
         # 2. Matched Observations
@@ -1423,6 +1748,7 @@ window.onload = function() {{
             obs_link = f'<a href="https://www.inaturalist.org/observations/{obs_id}" target="_blank" rel="noopener noreferrer">{obs_id}</a>' if obs_id else ""
             raw_ts = r.get("timestamp") or r.get("inat_timestamp") or ""
             timestamp = esc(raw_ts)
+            item_year = esc(extract_year(raw_ts))
             display_ts = esc(raw_ts.replace("T", " "))
 
             first_path = local_images[0] if local_images else ""
@@ -1439,7 +1765,7 @@ window.onload = function() {{
             row_human = "true" if any(img.get("human") for img in local_image_data) else "false"
             row_landscape = "true" if any(img.get("landscape") for img in local_image_data) else "false"
 
-            f.write(f'<tr data-matched="true" data-obs-id="{obs_id}" data-path="{esc(first_path)}" data-dir="{dir_path}" data-filename="{inat_file}" data-timestamp="{timestamp}" data-camera-types="{camera_types_json}" data-camera-names="{camera_names_json}" data-human="{row_human}" data-landscape="{row_landscape}">')
+            f.write(f'<tr data-matched="true" data-obs-id="{obs_id}" data-path="{esc(first_path)}" data-dir="{dir_path}" data-filename="{inat_file}" data-timestamp="{timestamp}" data-year="{item_year}" data-camera-types="{camera_types_json}" data-camera-names="{camera_names_json}" data-human="{row_human}" data-landscape="{row_landscape}">')
             f.write(f'<td><b>[MATCHED]</b><br>{inat_file}</td>')
             f.write(f'<td>{thumbs_html}</td>')
             f.write(f'<td><b>Local Files:</b><br>{local_names_html}{flags_html}</td>')
@@ -2132,11 +2458,13 @@ def scan_local_images(
         sig_key = (signature.get("size"), signature.get("mtime"))
         norm_name = normalize_filename(filename)
 
-        if (abs_path in non_live_paths or
+        is_non_live = (
+            abs_path in non_live_paths or
             path in non_live_paths or
-            sig_key in non_live_signatures):
+            sig_key in non_live_signatures
+        )
+        if is_non_live:
             skipped_non_live += 1
-            continue
 
         if use_cache:
             cached = cache.get(path)
@@ -2154,6 +2482,8 @@ def scan_local_images(
                         data["timestamp"] = dt.isoformat()
                         data["timestamp_minute"] = timestamp_minute(dt)
                         updated = True
+                data["non_live"] = is_non_live
+                data["signature"] = signature
                 images.append(data)
                 continue
 
@@ -2167,7 +2497,9 @@ def scan_local_images(
             "timestamp": dt.isoformat() if dt else None,
             "timestamp_minute": timestamp_minute(dt),
             "human": flags.get("human", False),
-            "landscape": flags.get("landscape", False)
+            "landscape": flags.get("landscape", False),
+            "non_live": is_non_live,
+            "signature": signature,
         }
         data.update(camera)
 
@@ -2184,7 +2516,10 @@ def scan_local_images(
         save_json(LOCAL_CACHE_FILE, cache)
 
     if skipped_non_live > 0:
-        print(f"Skipped {skipped_non_live} local photos marked as non-live creatures.")
+        print(
+            f"Included {skipped_non_live} local photos marked as non-live creatures "
+            "(shown in the report, excluded from iNaturalist matching)."
+        )
 
     print("Local images indexed:", len(images))
     return images
@@ -2208,6 +2543,8 @@ def build_local_indexes(
 
 
     for image in local_images:
+        if image.get("non_live"):
+            continue
 
 
         filename = image.get(
@@ -3071,6 +3408,7 @@ def apply_heuristic_flags_to_unmatched(
         image
         for image in local_images
         if _normalized_image_path(image.get("path")) not in matched_paths
+        and not image.get("non_live")
     ]
 
     detection_cache = {}
@@ -3321,7 +3659,7 @@ def main():
     parser.add_argument(
         "--non-live-file",
         default="non_live_photos.json",
-        help="JSON file containing list of non-live creature photos to skip scanning"
+        help="JSON file of non-live creature photos to include in the report but exclude from matching"
     )
 
     parser.add_argument(
