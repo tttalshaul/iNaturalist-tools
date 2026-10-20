@@ -206,13 +206,12 @@ class INaturalistClient:
             try:
 
 
+                print("Request URL: ", url)
                 response = self.session.get(
                     url,
                     params=params,
                     timeout=60
                 )
-
-                print("Response URL: ", response.url)
 
                 if response.status_code in (
                     403,
